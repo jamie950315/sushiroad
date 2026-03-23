@@ -9,6 +9,7 @@ const HISTORY_KEY = 'sushiroad_history';
 const SEAT_LABEL = { TABLE: '桌位', COUNTER: '吧台', T: '桌位', C: '吧台' };
 
 function esc(s) { return s == null ? '' : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function makeTopic(email) { const raw = (email || '').split('@')[0] || ''; const prefix = raw.replace(/[^a-zA-Z0-9._-]/g, '').substring(0, 8); return (prefix || 'user' + Math.random().toString(36).slice(2,8)) + '-sushiroad'; }
 function escJs(s) { return s == null ? '' : String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
 
 const $ = s => document.querySelector(s);
@@ -121,13 +122,18 @@ function bindEvents() {
   $('#btn-clear-history').addEventListener('click', () => { if (confirm('清除所有紀錄？')) { saveHistory([]); renderHistory(); } });
   $('#setting-store-poll').addEventListener('change', e => { setSetting('storePoll', Number(e.target.value)); startStorePoll(); });
   $('#setting-schedule-poll').addEventListener('change', e => setSetting('schedulePoll', Number(e.target.value)));
-  $('#setting-ntfy-topic').addEventListener('change', e => setSetting('ntfyTopic', e.target.value.trim()));
+  $('#setting-ntfy-topic').addEventListener('input', e => setSetting('ntfyTopic', e.target.value.trim()));
+  $('#setting-ntfy-topic').addEventListener('blur', e => setSetting('ntfyTopic', e.target.value.trim()));
+  $('#setting-early-window').addEventListener('change', e => { const n = Number(e.target.value); setSetting('earlyWindow', Number.isFinite(n) ? Math.max(0, Math.min(30, n)) : 10); });
+  $('#setting-late-window').addEventListener('change', e => { const n = Number(e.target.value); setSetting('lateWindow', Number.isFinite(n) ? Math.max(0, Math.min(30, n)) : 5); });
 }
 
 function initSettings() {
   $('#setting-store-poll').value = getSetting('storePoll', 60);
   $('#setting-schedule-poll').value = getSetting('schedulePoll', 60);
   $('#setting-ntfy-topic').value = getSetting('ntfyTopic', '');
+  $('#setting-early-window').value = getSetting('earlyWindow', 10);
+  $('#setting-late-window').value = getSetting('lateWindow', 5);
 }
 
 // ==================== Submit ====================
@@ -299,6 +305,8 @@ async function startMonitoring(targetTime) {
       adult: state.adult, child: state.child,
       targetTime, ntfyTopic,
       pollInterval: getSetting('schedulePoll', 60),
+      earlyWindow: Math.max(0, Math.min(30, Number(getSetting('earlyWindow', 10)) || 10)),
+      lateWindow: Math.max(0, Math.min(30, Number(getSetting('lateWindow', 5)) || 5)),
       sessionId: state.sessionId,
     }),
   });
@@ -390,11 +398,18 @@ async function updateMonitorBadge() {
 // ==================== Location ====================
 function requestLocation() {
   if (!navigator.geolocation) return alert('瀏覽器不支援定位');
-  if (state.userLat != null) { state.userLat = state.userLon = null; $('#btn-location').classList.remove('active'); renderStores(state.stores); return; }
+  if (state.locating) return;
+  state.locating = true;
+  // If already has location, clear it first then re-fetch
+  if (state.userLat != null) {
+    state.userLat = state.userLon = null;
+    setSetting('userLat', null); setSetting('userLon', null);
+    $('#btn-location').classList.remove('active');
+  }
   $('#btn-location').classList.add('loading'); $('#location-icon').textContent = '⏳';
   navigator.geolocation.getCurrentPosition(
-    p => { state.userLat = p.coords.latitude; state.userLon = p.coords.longitude; $('#btn-location').classList.remove('loading'); $('#btn-location').classList.add('active'); $('#location-icon').textContent = '📍'; renderStores(state.stores); },
-    e => { $('#btn-location').classList.remove('loading'); $('#location-icon').textContent = '📍'; alert('無法取得位置: ' + e.message); },
+    p => { state.locating = false; state.userLat = p.coords.latitude; state.userLon = p.coords.longitude; setSetting('userLat', state.userLat); setSetting('userLon', state.userLon); $('#btn-location').classList.remove('loading'); $('#btn-location').classList.add('active'); $('#location-icon').textContent = '📍'; renderStores(state.stores); },
+    e => { state.locating = false; $('#btn-location').classList.remove('loading'); $('#location-icon').textContent = '📍'; alert('無法取得位置: ' + e.message); },
     { enableHighAccuracy: true, timeout: 10000 }
   );
 }
@@ -413,6 +428,12 @@ async function doLogin() {
     if (data.success) {
       state.sessionId = data.sessionId;
       localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId: data.sessionId, email: data.email }));
+      // Auto-generate ntfy topic if not set
+      if (!getSetting('ntfyTopic', '')) {
+        const topic = makeTopic(data.email);
+        setSetting('ntfyTopic', topic);
+        $('#setting-ntfy-topic').value = topic;
+      }
       updateLoginUI(data.email); hideLoginDialog();
     } else {
       
@@ -439,7 +460,16 @@ async function restoreSession() {
     if (saved?.sessionId) {
       const res = await fetch('/api/auth/session/' + saved.sessionId);
       const data = await res.json();
-      if (data.valid) { state.sessionId = saved.sessionId; updateLoginUI(saved.email || data.email); }
+      if (data.valid) {
+        state.sessionId = saved.sessionId;
+        updateLoginUI(saved.email || data.email);
+        // Auto-generate ntfy topic if not set
+        const email = saved.email || data.email || '';
+        if (!getSetting('ntfyTopic', '') && email) {
+          setSetting('ntfyTopic', makeTopic(email));
+          $('#setting-ntfy-topic').value = getSetting('ntfyTopic', '');
+        }
+      }
       else localStorage.removeItem(SESSION_KEY);
     }
   } catch {}
@@ -455,6 +485,18 @@ window.requestLocation = requestLocation;
 window.cancelMonitor = cancelMonitor;
 window.pickSlot = pickSlot;
 window.startMonitoringFromUI = startMonitoringFromUI;
+
+// Restore saved location (validate coordinates)
+const savedLat = Number(getSetting('userLat', null));
+const savedLon = Number(getSetting('userLon', null));
+if (Number.isFinite(savedLat) && Number.isFinite(savedLon) && savedLat >= -90 && savedLat <= 90 && savedLon >= -180 && savedLon <= 180) {
+  state.userLat = savedLat;
+  state.userLon = savedLon;
+  document.addEventListener('DOMContentLoaded', () => { $('#btn-location')?.classList.add('active'); });
+} else {
+  setSetting('userLat', null);
+  setSetting('userLon', null);
+}
 
 init();
 restoreSession();
