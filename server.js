@@ -320,7 +320,7 @@ app.post('/api/ticket/cancel', async (req, res) => {
 
 app.post('/api/monitor', async (req, res) => {
   try {
-    const { storeid, storeName, adult = 2, child = 0, targetTime, ntfyTopic, pollInterval = 60, sessionId } = req.body;
+    const { storeid, storeName, adult = 2, child = 0, targetTime, ntfyTopic, pollInterval = 60, earlyWindow = 10, lateWindow = 5, sessionId } = req.body;
     if (!sessionId) return res.status(401).json({ error: 'login required' });
     if (!getAuthHeaders(sessionId)) return res.status(401).json({ error: 'session expired' });
 
@@ -349,9 +349,14 @@ app.post('/api/monitor', async (req, res) => {
     targetAt.setHours(th, tm, 0, 0);
     if (targetAt < taipeiNow) targetAt.setDate(targetAt.getDate() + 1);
 
+    const early = Math.max(0, Math.min(30, validInt(earlyWindow) ?? 10));
+    const late = Math.max(0, Math.min(30, validInt(lateWindow) ?? 5));
+
     const monitor = {
       monitorId, storeid: sid, storeName: storeName || '', adult, child, targetTime, ntfyTopic,
       sessionId,
+      earlyWindow: early,
+      lateWindow: late,
       targetAt: targetAt.getTime(),
       status: 'waiting',
       lastWait: null,
@@ -453,21 +458,26 @@ async function checkAndNotify(monitorId) {
     let notifyTitle = '';
     let notifyMessage = '';
 
-    if (waitMinutes === 0 && minutesUntilTarget <= 15 && minutesUntilTarget >= -5) {
+    const earlyMin = m.earlyWindow ?? 10;
+    const lateMin = m.lateWindow ?? 5;
+
+    if (waitMinutes === 0 && minutesUntilTarget <= earlyMin && minutesUntilTarget >= -lateMin) {
       // No queue — just go eat
       shouldNotify = true;
+      const arriveIn = Math.max(0, Math.round(minutesUntilTarget));
       notifyTitle = `壽司郎 ${store.name} - 現在沒人排隊！`;
-      notifyMessage = `🍣 ${store.name}\n🎉 目前無需等候，直接去吃！\n👥 ${m.adult}大${m.child}小`;
-      m.logs.push(`[${ts}] 無人排隊，直接去吃！`);
+      notifyMessage = `🍣 ${store.name}\n🎉 目前無需等候，直接去吃！\n👥 ${m.adult}大${m.child}小\n⏱️ 目標時間 ${m.targetTime}，約 ${arriveIn} 分鐘後`;
+      m.logs.push(`[${ts}] 無人排隊，直接去吃！(目標 ${arriveIn}分後)`);
     } else if (waitMinutes > 0) {
       // Has queue — check if now + wait ≈ target
-      const lowerBound = waitMinutes - 10;
-      const upperBound = waitMinutes + 5;
-      if (minutesUntilTarget <= upperBound && minutesUntilTarget >= Math.max(lowerBound, -5)) {
+      const lowerBound = waitMinutes - earlyMin;
+      const upperBound = waitMinutes + lateMin;
+      if (minutesUntilTarget <= upperBound && minutesUntilTarget >= Math.max(lowerBound, -lateMin)) {
         shouldNotify = true;
+        const arriveIn = Math.round(waitMinutes);
         notifyTitle = `壽司郎 ${store.name} - 現在去抽號！`;
-        notifyMessage = `🍣 ${store.name}\n⏰ 目前等候 ${waitMinutes} 分鐘\n👥 ${m.adult}大${m.child}小\n\n請立即打開壽司郎 APP 按「立即前往」抽號！`;
-        m.logs.push(`[${ts}] 最佳時機！現在抽號等 ${waitMinutes}分 → 剛好趕上目標時間`);
+        notifyMessage = `🍣 ${store.name}\n⏰ 目前等候 ${waitMinutes} 分鐘\n👥 ${m.adult}大${m.child}小\n⏱️ 抽號後約 ${arriveIn} 分鐘入座（目標 ${m.targetTime}）\n\n請立即打開壽司郎 APP 按「立即前往」抽號！`;
+        m.logs.push(`[${ts}] 最佳時機！抽號等 ${waitMinutes}分 → 約 ${arriveIn}分後入座`);
       }
     }
 

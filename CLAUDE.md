@@ -35,12 +35,15 @@ No build step. No tests. Static files served directly by Express.
 - Sushiro server has a bug: `newreservation` returns E010 even on success — we verify via `opentickets` endpoint
 - Check-in code = last 4 digits of `ticketId`
 - Time slots use `yyyyMMdd` date format and `HHmmss` time format
+- Smart slot picker: exact match → auto-reserve; ±15min nearby → user picks; none → monitoring mode
 
 ### Monitoring
 - Monitors are in-memory (Map), not persisted
 - Each monitor polls store wait time at configurable intervals (30-300s)
+- Configurable early/late window (how many minutes early or late is acceptable)
 - Notification logic: `wait=0` → "go eat directly", `wait>0 && now+wait≈target` → "go take ticket"
 - ntfy.sh notifications use JSON API to support UTF-8 titles
+- Auto-generates ntfy topic from user email on login (first 8 chars + `-sushiroad`)
 
 ### Security
 - Per-IP login rate limiting (5/min)
@@ -49,11 +52,18 @@ No build step. No tests. Static files served directly by Express.
 - Max 3 monitors per session
 - URL params validated with strict integer regex
 - Session cleanup cancels orphan monitors
+- Geolocation coordinates validated before restoring from localStorage
+
+### Persistence (Browser)
+- Session (sessionId + email) in localStorage
+- Settings (ntfy topic, poll intervals, early/late window) in localStorage
+- User geolocation saved and auto-restored on reload
+- Reservation history (last 50 entries) in localStorage
 
 ## File Structure
 
 ```
-server.js          # Express backend (API proxy + monitoring)
+server.js          # Express backend (API proxy + monitoring + ntfy)
 public/
   index.html       # Main UI (tabs: stores, history, monitor, settings)
   app.js           # Frontend logic
