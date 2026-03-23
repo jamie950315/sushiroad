@@ -1,0 +1,11 @@
+node_modules/
+apk/
+*.log
+*.jsonl
+captured_requests.*
+frida_hook*.js
+capture_*.py
+__pycache__/
+stores_raw.json
+boot.img*
+.ccreview-rejections.md

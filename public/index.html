@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>SushiRoad - 壽司郎智能訂位</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>SushiRoad</h1>
+    </header>
+
+    <main id="main-content">
+
+      <!-- ===== Tab: Stores ===== -->
+      <div class="tab-page active" id="page-stores">
+
+        <section id="step-store" class="step active">
+          <div class="search-bar">
+            <input type="text" id="store-search" placeholder="搜尋店名或地區..." autocomplete="off">
+            <button class="location-btn" id="btn-location" onclick="requestLocation()" title="依距離排序">
+              <span id="location-icon">📍</span>
+            </button>
+          </div>
+          <div id="store-list" class="store-list"></div>
+        </section>
+
+        <section id="step-config" class="step">
+          <h2>設定用餐資訊</h2>
+          <div id="selected-store-info" class="store-card selected"></div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>大人</label>
+              <div class="stepper">
+                <button class="stepper-btn" data-target="adult" data-action="dec">−</button>
+                <span id="adult-count">2</span>
+                <button class="stepper-btn" data-target="adult" data-action="inc">+</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>小孩</label>
+              <div class="stepper">
+                <button class="stepper-btn" data-target="child" data-action="dec">−</button>
+                <span id="child-count">0</span>
+                <button class="stepper-btn" data-target="child" data-action="inc">+</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>預計用餐時間</label>
+            <input type="time" id="target-time" value="12:00">
+            <p class="hint">系統會先嘗試預約該時段。若無可用時段，將監控等候時間並在最佳時機通知您去 APP 抽號。</p>
+          </div>
+
+          <div class="action-buttons">
+            <button id="btn-back" class="btn btn-secondary">← 返回</button>
+            <button id="btn-submit" class="btn btn-primary">預約 / 監控</button>
+          </div>
+        </section>
+
+        <section id="step-status" class="step">
+          <h2>狀態</h2>
+          <div id="ticket-status" class="status-panel"></div>
+          <div id="schedule-logs" class="logs" style="display:none"></div>
+          <div class="action-buttons">
+            <button id="btn-cancel-ticket" class="btn btn-danger" style="display:none">取消</button>
+            <button id="btn-new" class="btn btn-secondary">重新選擇</button>
+          </div>
+        </section>
+      </div>
+
+      <!-- ===== Tab: History ===== -->
+      <div class="tab-page" id="page-history">
+        <h2>預約紀錄</h2>
+        <div id="history-list" class="history-list">
+          <div class="empty-state">尚無紀錄</div>
+        </div>
+        <button id="btn-clear-history" class="btn btn-secondary" style="margin-top:12px;display:none">清除所有紀錄</button>
+      </div>
+
+      <!-- ===== Tab: Monitor ===== -->
+      <div class="tab-page" id="page-monitor">
+        <h2>即時監控</h2>
+        <div id="monitor-list" class="monitor-list">
+          <div class="empty-state">目前沒有進行中的監控</div>
+        </div>
+      </div>
+
+      <!-- ===== Tab: Settings ===== -->
+      <div class="tab-page" id="page-settings">
+        <h2>設定</h2>
+
+        <div class="settings-card" id="login-section">
+          <div class="setting-item">
+            <div class="setting-label">
+              <div class="setting-title">壽司郎帳號</div>
+              <div class="setting-desc" id="login-status-text">未登入 - 登入後可使用預約功能</div>
+            </div>
+            <div class="setting-control">
+              <button class="btn btn-primary btn-sm" id="btn-login" onclick="showLoginDialog()">登入</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-card" style="margin-top:12px">
+          <div class="setting-item">
+            <div class="setting-label">
+              <div class="setting-title">ntfy 通知 Topic</div>
+              <div class="setting-desc">當監控偵測到最佳抽號時機，透過 ntfy.sh 推播通知</div>
+            </div>
+            <div class="setting-control">
+              <input type="text" id="setting-ntfy-topic" placeholder="sushiroad-notify" class="overlay-input" style="width:140px;font-size:13px;padding:8px">
+            </div>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-label">
+              <div class="setting-title">監控檢查間隔</div>
+              <div class="setting-desc">檢查等候時間的頻率</div>
+            </div>
+            <div class="setting-control">
+              <select id="setting-schedule-poll">
+                <option value="30">30 秒</option>
+                <option value="60" selected>60 秒</option>
+                <option value="120">2 分鐘</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-label">
+              <div class="setting-title">店鋪列表刷新</div>
+              <div class="setting-desc">自動重新載入店鋪狀態</div>
+            </div>
+            <div class="setting-control">
+              <select id="setting-store-poll">
+                <option value="60" selected>60 秒</option>
+                <option value="120">2 分鐘</option>
+                <option value="300">5 分鐘</option>
+                <option value="0">關閉</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-card" style="margin-top:12px">
+          <div class="setting-item">
+            <div class="setting-label">
+              <div class="setting-title">版本</div>
+            </div>
+            <div class="setting-control">
+              <span class="setting-value">2.0.0</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+
+    <nav id="tab-bar">
+      <button class="tab-btn active" data-tab="stores">
+        <span class="tab-icon">🏪</span>
+        <span class="tab-label">店鋪</span>
+      </button>
+      <button class="tab-btn" data-tab="history">
+        <span class="tab-icon">📋</span>
+        <span class="tab-label">紀錄</span>
+      </button>
+      <button class="tab-btn" data-tab="monitor">
+        <span class="tab-icon">📡</span>
+        <span class="tab-label">監控</span>
+        <span class="tab-badge" id="monitor-badge" style="display:none">0</span>
+      </button>
+      <button class="tab-btn" data-tab="settings">
+        <span class="tab-icon">⚙️</span>
+        <span class="tab-label">設定</span>
+      </button>
+    </nav>
+
+    <div id="login-overlay" class="overlay" style="display:none">
+      <div class="overlay-backdrop" onclick="hideLoginDialog()"></div>
+      <div class="overlay-panel">
+        <h2>登入壽司郎帳號</h2>
+        <p class="hint" style="margin-bottom:16px">使用壽司郎 APP 帳號登入以使用預約功能</p>
+        <div class="form-group">
+          <label>Email</label>
+          <input type="email" id="login-email" placeholder="your@email.com" class="overlay-input">
+        </div>
+        <div class="form-group">
+          <label>密碼</label>
+          <input type="password" id="login-password" placeholder="密碼" class="overlay-input">
+        </div>
+        <div id="login-error" class="error-msg" style="display:none"></div>
+        <div class="action-buttons">
+          <button class="btn btn-secondary" onclick="hideLoginDialog()">取消</button>
+          <button class="btn btn-primary" id="btn-do-login" onclick="doLogin()">登入</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
