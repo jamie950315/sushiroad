@@ -9,7 +9,20 @@ const HISTORY_KEY = 'sushiroad_history';
 const SEAT_LABEL = { TABLE: '桌位', COUNTER: '吧台', T: '桌位', C: '吧台' };
 
 function esc(s) { return s == null ? '' : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
-function makeTopic(email) { const raw = (email || '').split('@')[0] || ''; const prefix = raw.replace(/[^a-zA-Z0-9._-]/g, '').substring(0, 8); return (prefix || 'user' + Math.random().toString(36).slice(2,8)) + '-sushiroad'; }
+function validNtfyTopic(t) { return typeof t === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(t); }
+function formatNtfyTopic(raw, maxLen = 64) {
+  let topic = String(raw || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^[-_]+|[-_]+$/g, '');
+  if (topic.length > maxLen) topic = topic.slice(0, maxLen).replace(/^[-_]+|[-_]+$/g, '');
+  return topic;
+}
+function fallbackNtfyTopic() { return 'user-' + Math.random().toString(36).slice(2, 8); }
+function makeTopic(email) {
+  const raw = (email || '').split('@')[0] || '';
+  const suffix = '-sushiroad';
+  const prefix = formatNtfyTopic(raw, 64 - suffix.length);
+  const safePrefix = prefix || formatNtfyTopic(fallbackNtfyTopic(), 64 - suffix.length);
+  return `${safePrefix}${suffix}`;
+}
 function escJs(s) { return s == null ? '' : String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
 
 const $ = s => document.querySelector(s);
@@ -17,6 +30,28 @@ const $$ = s => document.querySelectorAll(s);
 
 function getSetting(k, d) { try { return JSON.parse(localStorage.getItem(SETTINGS_KEY))?.[k] ?? d; } catch { return d; } }
 function setSetting(k, v) { const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); s[k] = v; localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
+function getSessionEmail() { try { return JSON.parse(localStorage.getItem(SESSION_KEY))?.email || ''; } catch { return ''; } }
+function getDefaultNtfyTopic() { return makeTopic(getSessionEmail()); }
+function getStoredValidNtfyTopic() {
+  const topic = getSetting('ntfyTopic', '');
+  return validNtfyTopic(topic) ? topic : '';
+}
+function getEffectiveNtfyTopic() {
+  const stored = getStoredValidNtfyTopic();
+  return stored || getDefaultNtfyTopic();
+}
+function showNtfyTopicError(msg) {
+  const el = $('#ntfy-topic-error');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+function hideNtfyTopicError() {
+  const el = $('#ntfy-topic-error');
+  if (!el) return;
+  el.textContent = '';
+  el.style.display = 'none';
+}
 function loadHistory() { try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; } catch { return []; } }
 function saveHistory(h) { localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); }
 function addHistory(e) { const h = loadHistory(); h.unshift(e); if (h.length > 50) h.length = 50; saveHistory(h); }
@@ -122,8 +157,20 @@ function bindEvents() {
   $('#btn-clear-history').addEventListener('click', () => { if (confirm('清除所有紀錄？')) { saveHistory([]); renderHistory(); } });
   $('#setting-store-poll').addEventListener('change', e => { setSetting('storePoll', Number(e.target.value)); startStorePoll(); });
   $('#setting-schedule-poll').addEventListener('change', e => setSetting('schedulePoll', Number(e.target.value)));
-  $('#setting-ntfy-topic').addEventListener('input', e => setSetting('ntfyTopic', e.target.value.trim()));
-  $('#setting-ntfy-topic').addEventListener('blur', e => setSetting('ntfyTopic', e.target.value.trim()));
+  $('#setting-ntfy-topic').addEventListener('input', () => hideNtfyTopicError());
+  $('#setting-ntfy-topic').addEventListener('blur', e => {
+    const raw = e.target.value.trim();
+    if (validNtfyTopic(raw)) {
+      e.target.value = raw;
+      setSetting('ntfyTopic', raw);
+      hideNtfyTopicError();
+      return;
+    }
+    const fallback = getEffectiveNtfyTopic();
+    e.target.value = fallback;
+    setSetting('ntfyTopic', fallback);
+    showNtfyTopicError('Topic 僅允許英文字母、數字、底線 (_) 與連字號 (-)，不接受句點 (.)，已還原為前一個有效值。');
+  });
   $('#setting-early-window').addEventListener('change', e => { const n = Number(e.target.value); setSetting('earlyWindow', Number.isFinite(n) ? Math.max(0, Math.min(30, n)) : 10); });
   $('#setting-late-window').addEventListener('change', e => { const n = Number(e.target.value); setSetting('lateWindow', Number.isFinite(n) ? Math.max(0, Math.min(30, n)) : 5); });
 }
@@ -131,7 +178,12 @@ function bindEvents() {
 function initSettings() {
   $('#setting-store-poll').value = getSetting('storePoll', 60);
   $('#setting-schedule-poll').value = getSetting('schedulePoll', 60);
-  $('#setting-ntfy-topic').value = getSetting('ntfyTopic', '');
+  const storedTopic = getSetting('ntfyTopic', '');
+  const normalizedTopic = formatNtfyTopic(storedTopic);
+  const effectiveTopic = validNtfyTopic(normalizedTopic) ? normalizedTopic : getDefaultNtfyTopic();
+  $('#setting-ntfy-topic').value = effectiveTopic;
+  setSetting('ntfyTopic', effectiveTopic);
+  hideNtfyTopicError();
   $('#setting-early-window').value = getSetting('earlyWindow', 10);
   $('#setting-late-window').value = getSetting('lateWindow', 5);
 }
@@ -429,10 +481,11 @@ async function doLogin() {
       state.sessionId = data.sessionId;
       localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId: data.sessionId, email: data.email }));
       // Auto-generate ntfy topic if not set
-      if (!getSetting('ntfyTopic', '')) {
+      if (!getStoredValidNtfyTopic()) {
         const topic = makeTopic(data.email);
         setSetting('ntfyTopic', topic);
         $('#setting-ntfy-topic').value = topic;
+        hideNtfyTopicError();
       }
       updateLoginUI(data.email); hideLoginDialog();
     } else {
@@ -465,9 +518,11 @@ async function restoreSession() {
         updateLoginUI(saved.email || data.email);
         // Auto-generate ntfy topic if not set
         const email = saved.email || data.email || '';
-        if (!getSetting('ntfyTopic', '') && email) {
-          setSetting('ntfyTopic', makeTopic(email));
-          $('#setting-ntfy-topic').value = getSetting('ntfyTopic', '');
+        if (!getStoredValidNtfyTopic() && email) {
+          const topic = makeTopic(email);
+          setSetting('ntfyTopic', topic);
+          $('#setting-ntfy-topic').value = topic;
+          hideNtfyTopicError();
         }
       }
       else localStorage.removeItem(SESSION_KEY);

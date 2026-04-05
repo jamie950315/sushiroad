@@ -39,7 +39,7 @@ const monitors = new Map();
 
 // --- Validation helpers ---
 function validInt(v) { if (!/^\d+$/.test(String(v))) return null; const n = Number(v); return Number.isInteger(n) ? n : null; }
-function validNtfyTopic(t) { return typeof t === 'string' && /^[a-zA-Z0-9._-]{1,64}$/.test(t); }
+function validNtfyTopic(t) { return typeof t === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(t); }
 
 // --- Helper: fetch from Sushiro API with timeout ---
 async function sushiroFetch(urlPath, options = {}) {
@@ -326,7 +326,7 @@ app.post('/api/monitor', async (req, res) => {
 
     const sid = validInt(storeid);
     if (sid === null || !targetTime) return res.status(400).json({ error: 'storeid and targetTime required' });
-    if (!validNtfyTopic(ntfyTopic)) return res.status(400).json({ error: 'invalid ntfyTopic (alphanumeric, 1-64 chars)' });
+    if (!validNtfyTopic(ntfyTopic)) return res.status(400).json({ error: 'invalid ntfyTopic (letters, numbers, underscore, hyphen; 1-64 chars)' });
 
     // Cap monitors per session
     let sessionMonitors = 0;
