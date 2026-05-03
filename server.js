@@ -40,6 +40,17 @@ const monitors = new Map();
 // --- Validation helpers ---
 function validInt(v) { if (!/^\d+$/.test(String(v))) return null; const n = Number(v); return Number.isInteger(n) ? n : null; }
 function validNtfyTopic(t) { return typeof t === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(t); }
+function formatNtfyTopic(raw, maxLen = 64) {
+  let topic = String(raw || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^[-_]+|[-_]+$/g, '');
+  if (topic.length > maxLen) topic = topic.slice(0, maxLen).replace(/^[-_]+|[-_]+$/g, '');
+  return topic;
+}
+function makeNtfyTopic(email) {
+  const suffix = '-sushiroad';
+  const rawPrefix = String(email || '').split('@')[0] || 'user';
+  const prefix = formatNtfyTopic(rawPrefix, 8) || `user-${uuidv4().slice(0, 6)}`;
+  return `${prefix}${suffix}`;
+}
 
 // --- Helper: fetch from Sushiro API with timeout ---
 async function sushiroFetch(urlPath, options = {}) {
@@ -102,7 +113,7 @@ app.post('/api/auth/login', async (req, res) => {
         customerId: result.data.customerid,
         expiresAt: Date.now() + 24 * 3600 * 1000,
       });
-      res.json({ sessionId, email, success: true });
+      res.json({ sessionId, email, ntfyTopic: makeNtfyTopic(email), success: true });
     } else {
       res.status(401).json({ success: false, error: '帳號或密碼錯誤' });
     }
@@ -114,7 +125,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/session/:sessionId', (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session || session.expiresAt < Date.now()) return res.status(401).json({ valid: false });
-  res.json({ valid: true, email: session.email });
+  res.json({ valid: true, email: session.email, ntfyTopic: makeNtfyTopic(session.email) });
 });
 
 app.delete('/api/auth/session/:sessionId', (req, res) => {

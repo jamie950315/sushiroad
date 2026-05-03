@@ -6,6 +6,8 @@ const state = {
 const SESSION_KEY = 'sushiroad_session';
 const SETTINGS_KEY = 'sushiroad_settings';
 const HISTORY_KEY = 'sushiroad_history';
+const PINNED_STORES_KEY = 'sushiroad_pinned_stores';
+const ACCOUNT_EMAIL_KEY = 'sushiroad_account_email';
 const SEAT_LABEL = { TABLE: '桌位', COUNTER: '吧台', T: '桌位', C: '吧台' };
 
 function esc(s) { return s == null ? '' : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
@@ -19,18 +21,63 @@ function fallbackNtfyTopic() { return 'user-' + Math.random().toString(36).slice
 function makeTopic(email) {
   const raw = (email || '').split('@')[0] || '';
   const suffix = '-sushiroad';
-  const prefix = formatNtfyTopic(raw, 64 - suffix.length);
+  const prefix = formatNtfyTopic(raw, 8);
   const safePrefix = prefix || formatNtfyTopic(fallbackNtfyTopic(), 64 - suffix.length);
   return `${safePrefix}${suffix}`;
 }
 function escJs(s) { return s == null ? '' : String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+function clampInt(v, min, max, fallback) {
+  const n = Number(v);
+  if (!Number.isInteger(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+function validTimeValue(v) {
+  return typeof v === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
+}
+function defaultTargetTime() {
+  const now = new Date();
+  now.setHours(now.getHours() + 1);
+  return now.toTimeString().slice(0, 5);
+}
 
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
 function getSetting(k, d) { try { return JSON.parse(localStorage.getItem(SETTINGS_KEY))?.[k] ?? d; } catch { return d; } }
 function setSetting(k, v) { const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); s[k] = v; localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
-function getSessionEmail() { try { return JSON.parse(localStorage.getItem(SESSION_KEY))?.email || ''; } catch { return ''; } }
+function shouldUseAutoNtfyTopic() {
+  const topic = getSetting('ntfyTopic', '');
+  const auto = getSetting('ntfyTopicAuto', null);
+  return !validNtfyTopic(topic) || auto === true || (auto == null && /^user-[a-z0-9]{6}-sushiroad$/.test(topic));
+}
+function setAutoNtfyTopic(topic) {
+  setSetting('ntfyTopic', topic);
+  setSetting('ntfyTopicAuto', true);
+  const input = $('#setting-ntfy-topic');
+  if (input) input.value = topic;
+  hideNtfyTopicError();
+}
+function applyLoginNtfyTopic(topic) {
+  const normalized = formatNtfyTopic(topic);
+  if (!validNtfyTopic(normalized) || !shouldUseAutoNtfyTopic()) return;
+  setAutoNtfyTopic(normalized);
+}
+function getSavedAccountEmail() {
+  return localStorage.getItem(ACCOUNT_EMAIL_KEY) || getSetting('accountEmail', '');
+}
+function saveAccountEmail(email) {
+  const normalized = String(email || '').trim();
+  if (!normalized) return;
+  localStorage.setItem(ACCOUNT_EMAIL_KEY, normalized);
+  setSetting('accountEmail', normalized);
+}
+function getSessionEmail() {
+  try {
+    return JSON.parse(localStorage.getItem(SESSION_KEY))?.email || getSavedAccountEmail();
+  } catch {
+    return getSavedAccountEmail();
+  }
+}
 function getDefaultNtfyTopic() { return makeTopic(getSessionEmail()); }
 function getStoredValidNtfyTopic() {
   const topic = getSetting('ntfyTopic', '');
@@ -55,6 +102,59 @@ function hideNtfyTopicError() {
 function loadHistory() { try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; } catch { return []; } }
 function saveHistory(h) { localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); }
 function addHistory(e) { const h = loadHistory(); h.unshift(e); if (h.length > 50) h.length = 50; saveHistory(h); }
+function saveReservationPeople() {
+  setSetting('reservationAdult', state.adult);
+  setSetting('reservationChild', state.child);
+}
+function applyReservationPeople(adult, child) {
+  state.adult = clampInt(adult, 1, 18, 2);
+  state.child = clampInt(child, 0, 17, 0);
+  $('#adult-count').textContent = state.adult;
+  $('#child-count').textContent = state.child;
+}
+function loadPinnedStoreIds() {
+  try {
+    const ids = JSON.parse(localStorage.getItem(PINNED_STORES_KEY)) || [];
+    return Array.isArray(ids) ? ids.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+function savePinnedStoreIds(ids) {
+  localStorage.setItem(PINNED_STORES_KEY, JSON.stringify([...new Set(ids.map(String))]));
+}
+function isPinnedStore(id) {
+  return loadPinnedStoreIds().includes(String(id));
+}
+function togglePinStore(id, event) {
+  event?.stopPropagation();
+  const sid = String(id);
+  const pinned = loadPinnedStoreIds();
+  const next = pinned.includes(sid) ? pinned.filter(x => x !== sid) : [...pinned, sid];
+  savePinnedStoreIds(next);
+  renderCurrentStores();
+}
+function getVisibleStores(stores) {
+  const hasLoc = state.userLat != null;
+  const pinnedIds = loadPinnedStoreIds();
+  const pinnedSet = new Set(pinnedIds);
+  const byId = new Map(stores.map(s => [String(s.id), s]));
+  const pinned = pinnedIds.map(id => byId.get(id)).filter(Boolean);
+  const regular = stores.filter(s => !pinnedSet.has(String(s.id)));
+  if (hasLoc) regular.sort((a,b) => a._dist - b._dist);
+  return { pinned, regular, hasLoc };
+}
+function movePinnedStore(dragId, targetId) {
+  if (!dragId || !targetId || dragId === targetId) return;
+  const pinned = loadPinnedStoreIds();
+  const from = pinned.indexOf(String(dragId));
+  const to = pinned.indexOf(String(targetId));
+  if (from < 0 || to < 0) return;
+  const [item] = pinned.splice(from, 1);
+  pinned.splice(to, 0, item);
+  savePinnedStoreIds(pinned);
+  renderCurrentStoresWithPinnedAnimation();
+}
 
 function distanceKm(lat1,lon1,lat2,lon2) { const R=6371,dLat=(lat2-lat1)*Math.PI/180,dLon=(lon2-lon1)*Math.PI/180,a=Math.sin(dLat/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2; return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a)); }
 function fmtDist(km) { return km < 1 ? Math.round(km*1000)+' m' : km.toFixed(1)+' km'; }
@@ -65,8 +165,6 @@ async function init() {
   bindEvents();
   initSettings();
   startStorePoll();
-  const now = new Date(); now.setHours(now.getHours() + 1);
-  $('#target-time').value = now.toTimeString().slice(0,5);
 }
 
 // ==================== Tabs ====================
@@ -86,7 +184,7 @@ async function loadStores() {
   try {
     const res = await fetch('/api/stores');
     state.stores = await res.json();
-    renderStores(state.stores);
+    renderCurrentStores();
   } catch (err) {
     $('#store-list').innerHTML = `<div class="error-msg">載入失敗: ${esc(err.message)}</div>`;
   }
@@ -95,32 +193,139 @@ async function loadStores() {
 function renderStores(stores) {
   const hasLoc = state.userLat != null;
   if (hasLoc) stores.forEach(s => { s._dist = distanceKm(state.userLat, state.userLon, s.latitude, s.longitude); });
+  const { pinned, regular } = getVisibleStores(stores);
 
   let html = '';
+  if (pinned.length) {
+    html += `<div class="pinned-group"><div class="area-header">置頂店鋪 (${pinned.length})</div>`;
+    pinned.forEach(s => { html += storeCard(s, hasLoc, true); });
+    html += '</div>';
+  }
+
   if (hasLoc) {
-    [...stores].sort((a,b) => a._dist - b._dist).forEach(s => { html += storeCard(s, true); });
+    regular.forEach(s => { html += storeCard(s, true, false); });
   } else {
     const grouped = {};
-    stores.forEach(s => { (grouped[s.area||'其他'] ??= []).push(s); });
+    regular.forEach(s => { (grouped[s.area||'其他'] ??= []).push(s); });
     for (const [area, list] of Object.entries(grouped)) {
       html += `<div class="area-group"><div class="area-header">${esc(area)} (${list.length})</div>`;
-      list.forEach(s => { html += storeCard(s, false); });
+      list.forEach(s => { html += storeCard(s, false, false); });
       html += '</div>';
     }
   }
-  $('#store-list').innerHTML = html;
+  $('#store-list').innerHTML = html || '<div class="empty-state">找不到符合條件的店鋪</div>';
 }
 
-function storeCard(s, showDist) {
+function storeCard(s, showDist, pinned = isPinnedStore(s.id)) {
   const open = s.storeStatus === 'OPEN';
   const wait = open && s.wait > 0 ? `<div class="wait-time has-wait">等候 ${s.wait} 分鐘</div>` : '';
   const dist = showDist && s._dist != null ? `<div class="store-distance">${fmtDist(s._dist)}</div>` : '';
-  return `<div class="store-card" onclick="selectStore('${escJs(String(s.id))}')">
-    <div><div class="store-name">${esc(s.name)}</div><div class="store-address">${esc(s.address)}</div>${dist}</div>
-    <div class="store-status"><span class="status-badge ${open?'open':'closed'}">${open?'營業中':'未營業'}</span>${wait}</div></div>`;
+  const rawId = String(s.id);
+  const id = escJs(rawId);
+  const dragging = rawId === state.draggedPinnedStoreId || rawId === state.pointerDraggedPinnedStoreId;
+  const drag = pinned
+    ? `<button class="pin-drag-handle" draggable="true" title="拖曳排序" onclick="event.stopPropagation()" onpointerdown="startPinnedStorePointerDrag(event,'${id}')" ondragstart="startPinnedStoreDrag(event,'${id}')" ondragend="endPinnedStoreDrag(event)">::</button>`
+    : '';
+  const pinTitle = pinned ? '取消置頂' : '置頂店鋪';
+  return `<div class="store-card ${pinned ? 'pinned-store' : ''} ${dragging ? 'dragging' : ''}" data-store-id="${esc(rawId)}" onclick="selectStore('${id}')" ondragenter="overPinnedStoreDrag(event,'${id}')" ondragover="overPinnedStoreDrag(event,'${id}')" ondrop="dropPinnedStoreDrag(event,'${id}')">
+    ${drag}
+    <div class="store-main"><div class="store-name">${esc(s.name)}</div><div class="store-address">${esc(s.address)}</div>${dist}</div>
+    <div class="store-status"><span class="status-badge ${open?'open':'closed'}">${open?'營業中':'未營業'}</span>${wait}</div>
+    <button class="pin-store-btn ${pinned ? 'active' : ''}" title="${pinTitle}" aria-label="${pinTitle}" onclick="togglePinStore('${id}', event)">${pinned ? '★' : '☆'}</button>
+  </div>`;
 }
 
-function filterStores(q) { if (!q) return renderStores(state.stores); const ql = q.toLowerCase(); renderStores(state.stores.filter(s => s.name.toLowerCase().includes(ql) || (s.area||'').toLowerCase().includes(ql))); }
+function getStoresMatchingQuery(q) {
+  if (!q) return state.stores;
+  const ql = q.toLowerCase();
+  return state.stores.filter(s => s.name.toLowerCase().includes(ql) || (s.area||'').toLowerCase().includes(ql));
+}
+function renderCurrentStores() {
+  renderStores(getStoresMatchingQuery($('#store-search')?.value || ''));
+}
+function renderCurrentStoresWithPinnedAnimation() {
+  const before = new Map([...document.querySelectorAll('.pinned-store')].map(el => [el.dataset.storeId, el.getBoundingClientRect()]));
+  renderCurrentStores();
+  requestAnimationFrame(() => {
+    document.querySelectorAll('.pinned-store').forEach(el => {
+      const oldRect = before.get(el.dataset.storeId);
+      if (!oldRect) return;
+      const newRect = el.getBoundingClientRect();
+      const dx = oldRect.left - newRect.left;
+      const dy = oldRect.top - newRect.top;
+      if (!dx && !dy) return;
+      el.animate([
+        { transform: `translate(${dx}px, ${dy}px)` },
+        { transform: 'translate(0, 0)' },
+      ], { duration: 150, easing: 'ease-out' });
+    });
+  });
+}
+function filterStores(q) {
+  renderStores(getStoresMatchingQuery(q));
+}
+function startPinnedStoreDrag(event, id) {
+  event.stopPropagation();
+  state.draggedPinnedStoreId = String(id);
+  state.lastPinnedDragTargetId = null;
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', String(id));
+  event.currentTarget.closest('.store-card')?.classList.add('dragging');
+}
+function overPinnedStoreDrag(event, id) {
+  if (!state.draggedPinnedStoreId || !isPinnedStore(id)) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  if (state.lastPinnedDragTargetId === String(id)) return;
+  state.lastPinnedDragTargetId = String(id);
+  movePinnedStore(state.draggedPinnedStoreId, id);
+}
+function dropPinnedStoreDrag(event, id) {
+  if (!state.draggedPinnedStoreId || !isPinnedStore(id)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  state.draggedPinnedStoreId = null;
+  state.lastPinnedDragTargetId = null;
+  renderCurrentStores();
+}
+function endPinnedStoreDrag(event) {
+  event.currentTarget.closest('.store-card')?.classList.remove('dragging');
+  state.draggedPinnedStoreId = null;
+  state.lastPinnedDragTargetId = null;
+  renderCurrentStores();
+}
+function startPinnedStorePointerDrag(event, id) {
+  event.stopPropagation();
+  state.pointerDraggedPinnedStoreId = String(id);
+  state.lastPinnedDragTargetId = null;
+  state.pointerDragStartedAt = { x: event.clientX, y: event.clientY };
+  event.currentTarget.closest('.store-card')?.classList.add('dragging');
+  document.addEventListener('pointermove', movePinnedStorePointerDrag);
+  document.addEventListener('pointerup', finishPinnedStorePointerDrag, { once: true });
+  document.addEventListener('pointercancel', cancelPinnedStorePointerDrag, { once: true });
+}
+function movePinnedStorePointerDrag(event) {
+  const dragId = state.pointerDraggedPinnedStoreId;
+  if (!dragId) return;
+  const targetCard = document.elementFromPoint(event.clientX, event.clientY)?.closest('.pinned-store');
+  const targetId = targetCard?.dataset.storeId;
+  if (!targetId || targetId === dragId || state.lastPinnedDragTargetId === targetId) return;
+  state.lastPinnedDragTargetId = targetId;
+  movePinnedStore(dragId, targetId);
+}
+function finishPinnedStorePointerDrag(event) {
+  const dragId = state.pointerDraggedPinnedStoreId;
+  if (dragId) movePinnedStorePointerDrag(event);
+  cancelPinnedStorePointerDrag();
+}
+function cancelPinnedStorePointerDrag() {
+  document.removeEventListener('pointermove', movePinnedStorePointerDrag);
+  document.querySelector('.store-card.dragging')?.classList.remove('dragging');
+  state.pointerDraggedPinnedStoreId = null;
+  state.pointerDragStartedAt = null;
+  state.lastPinnedDragTargetId = null;
+  renderCurrentStores();
+}
 
 function selectStore(id) {
   state.selectedStore = state.stores.find(s => String(s.id) === String(id));
@@ -148,6 +353,7 @@ function bindEvents() {
       const t = btn.dataset.target, a = btn.dataset.action;
       if (t === 'adult') { state.adult = Math.max(1, Math.min(18, state.adult + (a === 'inc' ? 1 : -1))); $('#adult-count').textContent = state.adult; }
       else { state.child = Math.max(0, Math.min(17, state.child + (a === 'inc' ? 1 : -1))); $('#child-count').textContent = state.child; }
+      saveReservationPeople();
     });
   });
   $('#btn-back').addEventListener('click', () => showStep('store'));
@@ -157,18 +363,23 @@ function bindEvents() {
   $('#btn-clear-history').addEventListener('click', () => { if (confirm('清除所有紀錄？')) { saveHistory([]); renderHistory(); } });
   $('#setting-store-poll').addEventListener('change', e => { setSetting('storePoll', Number(e.target.value)); startStorePoll(); });
   $('#setting-schedule-poll').addEventListener('change', e => setSetting('schedulePoll', Number(e.target.value)));
+  $('#target-time').addEventListener('change', e => {
+    if (validTimeValue(e.target.value)) setSetting('targetTime', e.target.value);
+  });
   $('#setting-ntfy-topic').addEventListener('input', () => hideNtfyTopicError());
   $('#setting-ntfy-topic').addEventListener('blur', e => {
     const raw = e.target.value.trim();
     if (validNtfyTopic(raw)) {
       e.target.value = raw;
       setSetting('ntfyTopic', raw);
+      setSetting('ntfyTopicAuto', false);
       hideNtfyTopicError();
       return;
     }
     const fallback = getEffectiveNtfyTopic();
     e.target.value = fallback;
     setSetting('ntfyTopic', fallback);
+    setSetting('ntfyTopicAuto', shouldUseAutoNtfyTopic());
     showNtfyTopicError('Topic 僅允許英文字母、數字、底線 (_) 與連字號 (-)，不接受句點 (.)，已還原為前一個有效值。');
   });
   $('#setting-early-window').addEventListener('change', e => { const n = Number(e.target.value); setSetting('earlyWindow', Number.isFinite(n) ? Math.max(0, Math.min(30, n)) : 10); });
@@ -176,16 +387,22 @@ function bindEvents() {
 }
 
 function initSettings() {
+  applyReservationPeople(getSetting('reservationAdult', 2), getSetting('reservationChild', 0));
+  const savedTargetTime = getSetting('targetTime', '');
+  $('#target-time').value = validTimeValue(savedTargetTime) ? savedTargetTime : defaultTargetTime();
   $('#setting-store-poll').value = getSetting('storePoll', 60);
   $('#setting-schedule-poll').value = getSetting('schedulePoll', 60);
   const storedTopic = getSetting('ntfyTopic', '');
   const normalizedTopic = formatNtfyTopic(storedTopic);
   const effectiveTopic = validNtfyTopic(normalizedTopic) ? normalizedTopic : getDefaultNtfyTopic();
   $('#setting-ntfy-topic').value = effectiveTopic;
-  setSetting('ntfyTopic', effectiveTopic);
+  if (validNtfyTopic(storedTopic)) {
+    setSetting('ntfyTopic', effectiveTopic);
+  }
   hideNtfyTopicError();
   $('#setting-early-window').value = getSetting('earlyWindow', 10);
   $('#setting-late-window').value = getSetting('lateWindow', 5);
+  if (!state.sessionId) updateLoginUI(null);
 }
 
 // ==================== Submit ====================
@@ -201,6 +418,8 @@ async function handleSubmit() {
 
   const targetTime = $('#target-time').value;
   if (!targetTime) return alert('請選擇用餐時間');
+  if (validTimeValue(targetTime)) setSetting('targetTime', targetTime);
+  saveReservationPeople();
 
   $('#btn-submit').disabled = true;
   $('#btn-submit').textContent = '處理中...';
@@ -460,14 +679,14 @@ function requestLocation() {
   }
   $('#btn-location').classList.add('loading'); $('#location-icon').textContent = '⏳';
   navigator.geolocation.getCurrentPosition(
-    p => { state.locating = false; state.userLat = p.coords.latitude; state.userLon = p.coords.longitude; setSetting('userLat', state.userLat); setSetting('userLon', state.userLon); $('#btn-location').classList.remove('loading'); $('#btn-location').classList.add('active'); $('#location-icon').textContent = '📍'; renderStores(state.stores); },
+    p => { state.locating = false; state.userLat = p.coords.latitude; state.userLon = p.coords.longitude; setSetting('userLat', state.userLat); setSetting('userLon', state.userLon); $('#btn-location').classList.remove('loading'); $('#btn-location').classList.add('active'); $('#location-icon').textContent = '📍'; renderCurrentStores(); },
     e => { state.locating = false; $('#btn-location').classList.remove('loading'); $('#location-icon').textContent = '📍'; alert('無法取得位置: ' + e.message); },
     { enableHighAccuracy: true, timeout: 10000 }
   );
 }
 
 // ==================== Login ====================
-function showLoginDialog() { $('#login-overlay').style.display = 'flex'; $('#login-error').style.display = 'none'; $('#login-email').value = ''; $('#login-password').value = ''; }
+function showLoginDialog() { $('#login-overlay').style.display = 'flex'; $('#login-error').style.display = 'none'; $('#login-email').value = getSavedAccountEmail(); $('#login-password').value = ''; }
 function hideLoginDialog() { $('#login-overlay').style.display = 'none'; }
 
 async function doLogin() {
@@ -480,13 +699,8 @@ async function doLogin() {
     if (data.success) {
       state.sessionId = data.sessionId;
       localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId: data.sessionId, email: data.email }));
-      // Auto-generate ntfy topic if not set
-      if (!getStoredValidNtfyTopic()) {
-        const topic = makeTopic(data.email);
-        setSetting('ntfyTopic', topic);
-        $('#setting-ntfy-topic').value = topic;
-        hideNtfyTopicError();
-      }
+      saveAccountEmail(data.email);
+      applyLoginNtfyTopic(data.ntfyTopic || makeTopic(data.email));
       updateLoginUI(data.email); hideLoginDialog();
     } else {
       
@@ -504,7 +718,12 @@ function logout() {
 
 function updateLoginUI(email) {
   if (email) { $('#login-status-text').textContent = '已登入: ' + email; $('#btn-login').textContent = '登出'; $('#btn-login').onclick = logout; }
-  else { $('#login-status-text').textContent = '未登入 - 登入後可使用預約功能'; $('#btn-login').textContent = '登入'; $('#btn-login').onclick = showLoginDialog; }
+  else {
+    const savedEmail = getSavedAccountEmail();
+    $('#login-status-text').textContent = savedEmail ? '未登入 - 已記住帳號: ' + savedEmail : '未登入 - 登入後可使用預約功能';
+    $('#btn-login').textContent = '登入';
+    $('#btn-login').onclick = showLoginDialog;
+  }
 }
 
 async function restoreSession() {
@@ -516,16 +735,19 @@ async function restoreSession() {
       if (data.valid) {
         state.sessionId = saved.sessionId;
         updateLoginUI(saved.email || data.email);
-        // Auto-generate ntfy topic if not set
         const email = saved.email || data.email || '';
-        if (!getStoredValidNtfyTopic() && email) {
-          const topic = makeTopic(email);
-          setSetting('ntfyTopic', topic);
-          $('#setting-ntfy-topic').value = topic;
-          hideNtfyTopicError();
+        if (email) {
+          saveAccountEmail(email);
+          applyLoginNtfyTopic(data.ntfyTopic || makeTopic(email));
         }
       }
-      else localStorage.removeItem(SESSION_KEY);
+      else {
+        if (saved.email) saveAccountEmail(saved.email);
+        localStorage.removeItem(SESSION_KEY);
+        updateLoginUI(null);
+      }
+    } else {
+      updateLoginUI(null);
     }
   } catch {}
 }
@@ -540,6 +762,12 @@ window.requestLocation = requestLocation;
 window.cancelMonitor = cancelMonitor;
 window.pickSlot = pickSlot;
 window.startMonitoringFromUI = startMonitoringFromUI;
+window.togglePinStore = togglePinStore;
+window.startPinnedStoreDrag = startPinnedStoreDrag;
+window.overPinnedStoreDrag = overPinnedStoreDrag;
+window.dropPinnedStoreDrag = dropPinnedStoreDrag;
+window.endPinnedStoreDrag = endPinnedStoreDrag;
+window.startPinnedStorePointerDrag = startPinnedStorePointerDrag;
 
 // Restore saved location (validate coordinates)
 const savedLat = Number(getSetting('userLat', null));

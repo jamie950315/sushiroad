@@ -197,6 +197,10 @@ h2 {
   margin-bottom: 8px;
 }
 
+.pinned-group {
+  margin-bottom: 12px;
+}
+
 .area-header {
   font-size: 13px;
   font-weight: 600;
@@ -210,8 +214,8 @@ h2 {
 
 .store-card {
   background: var(--card);
-  border-radius: 12px;
-  padding: 14px 16px;
+  border-radius: 8px;
+  padding: 12px 12px;
   margin-bottom: 8px;
   box-shadow: var(--shadow);
   cursor: pointer;
@@ -219,6 +223,8 @@ h2 {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 10px;
+  border: 1px solid transparent;
 }
 
 .store-card:active {
@@ -230,6 +236,62 @@ h2 {
   border: 2px solid var(--primary);
 }
 
+.store-card.pinned-store {
+  border-color: rgba(230, 57, 70, 0.28);
+  background: #fffafa;
+}
+
+.store-card.dragging {
+  opacity: 0.55;
+  box-shadow: none;
+}
+
+.pin-drag-handle,
+.pin-store-btn {
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text-light);
+  cursor: grab;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.pin-drag-handle {
+  width: 24px;
+  height: 34px;
+  border-radius: 6px;
+  font-size: 16px;
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: -1px;
+  touch-action: none;
+}
+
+.pin-drag-handle:active {
+  cursor: grabbing;
+}
+
+.pin-store-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  font-size: 18px;
+  line-height: 1;
+  color: #adb5bd;
+  cursor: pointer;
+}
+
+.pin-store-btn.active {
+  border-color: rgba(230, 57, 70, 0.35);
+  color: var(--primary);
+  background: #fff0f0;
+}
+
+.store-main {
+  min-width: 0;
+  flex: 1;
+}
+
 .store-name {
   font-weight: 600;
   font-size: 15px;
@@ -239,7 +301,6 @@ h2 {
   font-size: 12px;
   color: var(--text-light);
   margin-top: 2px;
-  max-width: 240px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -248,6 +309,7 @@ h2 {
 .store-status {
   text-align: right;
   flex-shrink: 0;
+  min-width: 72px;
 }
 
 .status-badge {
