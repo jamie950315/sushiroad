@@ -1,6 +1,7 @@
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3737;
@@ -11,6 +12,8 @@ const UA = 'Dart/3.6 (dart:io)';
 const FETCH_TIMEOUT_MS = 12000;
 const MAX_MONITORS_PER_SESSION = 3;
 const MAX_MONITOR_LOGS = 100;
+const MONITOR_STORE_CACHE_MS = 30000;
+const DB_PATH = process.env.SUSHIROAD_DB || path.join(__dirname, 'data', 'sushiroad.db.json');
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public'), {
@@ -36,6 +39,161 @@ function checkLoginRate(ip) {
 // --- In-memory state ---
 const sessions = new Map();
 const monitors = new Map();
+const monitorStoreCache = {
+  stores: null,
+  fetchedAt: 0,
+  inFlight: null,
+};
+
+// --- Lightweight file DB ---
+function createEmptyDb() {
+  return { version: 1, monitors: {}, reservations: {}, settings: {} };
+}
+
+function loadDb() {
+  try {
+    if (!fs.existsSync(DB_PATH)) return createEmptyDb();
+    const parsed = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    return {
+      version: 1,
+      monitors: parsed.monitors && typeof parsed.monitors === 'object' ? parsed.monitors : {},
+      reservations: parsed.reservations && typeof parsed.reservations === 'object' ? parsed.reservations : {},
+      settings: parsed.settings && typeof parsed.settings === 'object' ? parsed.settings : {},
+    };
+  } catch (err) {
+    console.error(`Failed to load DB: ${err.message}`);
+    return createEmptyDb();
+  }
+}
+
+let db = loadDb();
+
+function saveDb() {
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  const tmpPath = `${DB_PATH}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(db, null, 2));
+  fs.renameSync(tmpPath, DB_PATH);
+}
+
+function accountKey(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function persistMonitor(m) {
+  const { intervalId, isRunning, ...record } = m;
+  db.monitors[m.monitorId] = record;
+  saveDb();
+}
+
+function deletePersistedMonitor(id) {
+  if (db.monitors[id]) {
+    delete db.monitors[id];
+    saveDb();
+  }
+}
+
+function persistReservation(account, ticket) {
+  if (!account || !ticket?.ticketId) return;
+  const id = String(ticket.ticketId);
+  db.reservations[id] = {
+    ...ticket,
+    accountKey: account,
+    updatedAt: new Date().toISOString(),
+  };
+  saveDb();
+}
+
+function markReservationCancelled(account, ticketId) {
+  if (!ticketId) return;
+  const id = String(ticketId);
+  const existing = db.reservations[id];
+  if (!existing || existing.accountKey !== account) return;
+  existing.status = 'cancelled';
+  existing.updatedAt = new Date().toISOString();
+  saveDb();
+}
+
+function validTimeValue(v) {
+  return typeof v === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
+}
+
+function defaultAccountSettings(email) {
+  return {
+    ntfyTopic: makeNtfyTopic(email),
+    ntfyTopicAuto: true,
+    storePoll: 60,
+    schedulePoll: 60,
+    earlyWindow: 10,
+    lateWindow: 5,
+    reservationAdult: 2,
+    reservationChild: 0,
+    pinnedStoreIds: [],
+    userLat: null,
+    userLon: null,
+  };
+}
+
+function sanitizeSettings(input = {}, defaults = defaultAccountSettings('')) {
+  const out = {};
+  if (validNtfyTopic(input.ntfyTopic)) out.ntfyTopic = input.ntfyTopic;
+  if (typeof input.ntfyTopicAuto === 'boolean') out.ntfyTopicAuto = input.ntfyTopicAuto;
+
+  const storePoll = validInt(input.storePoll);
+  if (storePoll !== null && [0, 60, 120, 300].includes(storePoll)) out.storePoll = storePoll;
+
+  const schedulePoll = validInt(input.schedulePoll);
+  if (schedulePoll !== null) out.schedulePoll = Math.max(30, Math.min(300, schedulePoll));
+
+  const earlyWindow = validInt(input.earlyWindow);
+  if (earlyWindow !== null) out.earlyWindow = Math.max(0, Math.min(30, earlyWindow));
+
+  const lateWindow = validInt(input.lateWindow);
+  if (lateWindow !== null) out.lateWindow = Math.max(0, Math.min(30, lateWindow));
+
+  const adult = validInt(input.reservationAdult);
+  if (adult !== null) out.reservationAdult = Math.max(1, Math.min(18, adult));
+
+  const child = validInt(input.reservationChild);
+  if (child !== null) out.reservationChild = Math.max(0, Math.min(17, child));
+
+  if (Array.isArray(input.pinnedStoreIds)) {
+    out.pinnedStoreIds = [...new Set(input.pinnedStoreIds.map(String).filter(id => validInt(id) !== null))].slice(0, 100);
+  }
+
+  if (input.userLat === null) out.userLat = null;
+  else {
+    const lat = Number(input.userLat);
+    if (Number.isFinite(lat) && lat >= -90 && lat <= 90) out.userLat = lat;
+  }
+
+  if (input.userLon === null) out.userLon = null;
+  else {
+    const lon = Number(input.userLon);
+    if (Number.isFinite(lon) && lon >= -180 && lon <= 180) out.userLon = lon;
+  }
+
+  return { ...defaults, ...out };
+}
+
+function getAccountSettings(account, email) {
+  const defaults = defaultAccountSettings(email);
+  const existing = db.settings[account];
+  return {
+    settings: sanitizeSettings(existing || {}, defaults),
+    exists: Boolean(existing),
+  };
+}
+
+function saveAccountSettings(account, email, incoming) {
+  const current = getAccountSettings(account, email).settings;
+  const settings = sanitizeSettings({ ...current, ...(incoming || {}) }, defaultAccountSettings(email));
+  db.settings[account] = {
+    ...settings,
+    updatedAt: new Date().toISOString(),
+  };
+  saveDb();
+  return settings;
+}
 
 // --- Validation helpers ---
 function validInt(v) { if (!/^\d+$/.test(String(v))) return null; const n = Number(v); return Number.isInteger(n) ? n : null; }
@@ -89,6 +247,12 @@ function getAuthHeaders(sessionId) {
   return { headers: { 'Authorization': `Basic ${session.basicAuth}` }, session };
 }
 
+function getSessionAuth(sessionId) {
+  const auth = getAuthHeaders(sessionId);
+  if (!auth) return null;
+  return { ...auth, accountKey: accountKey(auth.session.email) };
+}
+
 // --- Auth Routes ---
 
 app.post('/api/auth/login', async (req, res) => {
@@ -107,13 +271,22 @@ app.post('/api/auth/login', async (req, res) => {
 
     if (result.status === 200 && result.data?.status === 'SUCCESS') {
       const sessionId = uuidv4();
+      const key = accountKey(email);
+      const accountSettings = getAccountSettings(key, email);
       sessions.set(sessionId, {
         basicAuth: makeBasicAuth(email, password),
         email,
         customerId: result.data.customerid,
         expiresAt: Date.now() + 24 * 3600 * 1000,
       });
-      res.json({ sessionId, email, ntfyTopic: makeNtfyTopic(email), success: true });
+      res.json({
+        sessionId,
+        email,
+        ntfyTopic: accountSettings.settings.ntfyTopic,
+        settings: accountSettings.settings,
+        settingsExists: accountSettings.exists,
+        success: true,
+      });
     } else {
       res.status(401).json({ success: false, error: '帳號或密碼錯誤' });
     }
@@ -125,21 +298,36 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/session/:sessionId', (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session || session.expiresAt < Date.now()) return res.status(401).json({ valid: false });
-  res.json({ valid: true, email: session.email, ntfyTopic: makeNtfyTopic(session.email) });
+  const accountSettings = getAccountSettings(accountKey(session.email), session.email);
+  res.json({
+    valid: true,
+    email: session.email,
+    ntfyTopic: accountSettings.settings.ntfyTopic,
+    settings: accountSettings.settings,
+    settingsExists: accountSettings.exists,
+  });
 });
 
 app.delete('/api/auth/session/:sessionId', (req, res) => {
   const sid = req.params.sessionId;
   sessions.delete(sid);
-  // Cancel orphan monitors for this session
-  for (const [id, m] of monitors) {
-    if (m.sessionId === sid && (m.status === 'waiting' || m.status === 'monitoring')) {
-      clearInterval(m.intervalId);
-      m.status = 'cancelled';
-      monitors.delete(id);
-    }
-  }
   res.json({ success: true });
+});
+
+// --- Account settings ---
+
+app.get('/api/settings', (req, res) => {
+  const auth = getSessionAuth(req.query.sessionId);
+  if (!auth) return res.status(401).json({ error: 'Session expired' });
+  const accountSettings = getAccountSettings(auth.accountKey, auth.session.email);
+  res.json(accountSettings);
+});
+
+app.patch('/api/settings', (req, res) => {
+  const auth = getSessionAuth(req.body?.sessionId);
+  if (!auth) return res.status(401).json({ error: 'Session expired' });
+  const settings = saveAccountSettings(auth.accountKey, auth.session.email, req.body?.settings || {});
+  res.json({ success: true, settings });
 });
 
 // --- Store Routes ---
@@ -227,7 +415,7 @@ app.post('/api/reservation', async (req, res) => {
     const sid = validInt(storeid);
     if (sid === null || !date || !time) return res.status(400).json({ error: 'storeid, date, time required' });
 
-    const auth = getAuthHeaders(sessionId);
+    const auth = getSessionAuth(sessionId);
     if (!auth) return res.status(401).json({ error: 'Session expired' });
 
     const guid = uuidv4();
@@ -247,17 +435,20 @@ app.post('/api/reservation', async (req, res) => {
         r.TICKET_DETAIL?.storeId === String(sid) && r.TICKET_DETAIL?.start === time
       );
       if (created) {
-        return res.json({
+        const reservation = {
           success: true,
           ticketId: created.TICKET_DETAIL.ticketId,
           ticketNo: created.TICKET_DETAIL.number,
           checkinCode: String(created.TICKET_DETAIL.ticketId).slice(-4),
           waitTime: created.TICKET_DETAIL.wait,
           storeName: created.STORE_INFO?.name,
+          storeid: sid,
           date: created.TICKET_DETAIL.queueDate,
           time: created.TICKET_DETAIL.start,
           guid,
-        });
+        };
+        persistReservation(auth.accountKey, reservation);
+        return res.json(reservation);
       }
     }
 
@@ -265,7 +456,23 @@ app.post('/api/reservation', async (req, res) => {
       return res.json({ error: '已有預約，請先取消', code: 'E052' });
     }
 
-    res.json({ ...result.data, guid });
+    const response = { ...result.data, guid };
+    if (response.ticketId || response.TICKET_DETAIL?.ticketId) {
+      const detail = response.TICKET_DETAIL || response;
+      persistReservation(auth.accountKey, {
+        success: true,
+        ticketId: detail.ticketId,
+        ticketNo: detail.number || detail.ticketNo,
+        checkinCode: String(detail.ticketId).slice(-4),
+        waitTime: detail.wait,
+        storeName: response.STORE_INFO?.name,
+        storeid: sid,
+        date: detail.queueDate || date,
+        time: detail.start || time,
+        guid,
+      });
+    }
+    res.json(response);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -292,11 +499,56 @@ app.get('/api/ticket/status', async (req, res) => {
   }
 });
 
+function normalizeOpenReservation(item) {
+  const detail = item?.TICKET_DETAIL || item || {};
+  const store = item?.STORE_INFO || {};
+  const ticketId = detail.ticketId || detail.ticketID || detail.id;
+  return {
+    ticketId,
+    ticketNo: detail.number || detail.ticketNo || detail.ticketNumber || '',
+    checkinCode: ticketId ? String(ticketId).slice(-4) : '',
+    waitTime: detail.wait,
+    storeName: store.name || detail.storeName || '',
+    storeid: detail.storeId || detail.storeid || '',
+    date: detail.queueDate || detail.date || '',
+    time: detail.start || detail.time || '',
+    status: 'active',
+  };
+}
+
+app.get('/api/reservations', async (req, res) => {
+  try {
+    const auth = getSessionAuth(req.query.sessionId);
+    if (!auth) return res.status(401).json({ error: 'Session expired' });
+
+    const result = await sushiroFetch(`/remote_auth/opentickets?region=${REGION}`, { headers: auth.headers });
+    const remoteReservations = Array.isArray(result.data?.RESERVATIONS)
+      ? result.data.RESERVATIONS.map(normalizeOpenReservation).filter(r => r.ticketId)
+      : [];
+
+    for (const reservation of remoteReservations) persistReservation(auth.accountKey, reservation);
+
+    const remoteIds = new Set(remoteReservations.map(r => String(r.ticketId)));
+    for (const reservation of Object.values(db.reservations)) {
+      if (reservation.accountKey !== auth.accountKey || reservation.status === 'cancelled') continue;
+      if (reservation.ticketId && !remoteIds.has(String(reservation.ticketId))) {
+        reservation.status = 'closed';
+        reservation.updatedAt = new Date().toISOString();
+      }
+    }
+    saveDb();
+
+    res.json(remoteReservations);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/ticket/cancel', async (req, res) => {
   try {
     const { guid, ticketNo, ticketId, storeid, sessionId } = req.body;
     if (sessionId) {
-      const auth = getAuthHeaders(sessionId);
+      const auth = getSessionAuth(sessionId);
       if (auth) {
         const body = { region: REGION };
         if (ticketId) body.ticketId = ticketId;
@@ -308,6 +560,7 @@ app.post('/api/ticket/cancel', async (req, res) => {
           headers: { 'Content-Type': 'application/json', ...auth.headers },
           body: JSON.stringify(body),
         });
+        markReservationCancelled(auth.accountKey, ticketId);
         return res.json(result.data);
       }
     }
@@ -333,18 +586,20 @@ app.post('/api/monitor', async (req, res) => {
   try {
     const { storeid, storeName, adult = 2, child = 0, targetTime, ntfyTopic, pollInterval = 60, earlyWindow = 10, lateWindow = 5, sessionId } = req.body;
     if (!sessionId) return res.status(401).json({ error: 'login required' });
-    if (!getAuthHeaders(sessionId)) return res.status(401).json({ error: 'session expired' });
+    const auth = getSessionAuth(sessionId);
+    if (!auth) return res.status(401).json({ error: 'session expired' });
 
     const sid = validInt(storeid);
     if (sid === null || !targetTime) return res.status(400).json({ error: 'storeid and targetTime required' });
     if (!validNtfyTopic(ntfyTopic)) return res.status(400).json({ error: 'invalid ntfyTopic (letters, numbers, underscore, hyphen; 1-64 chars)' });
 
-    // Cap monitors per session
-    let sessionMonitors = 0;
+    // Cap monitors per account, so multiple devices share one quota.
+    let accountMonitors = 0;
     for (const [, m] of monitors) {
-      if (m.sessionId === sessionId && (m.status === 'waiting' || m.status === 'monitoring')) sessionMonitors++;
+      const owner = m.accountKey || accountKey(m.accountEmail);
+      if (owner === auth.accountKey && (m.status === 'waiting' || m.status === 'monitoring')) accountMonitors++;
     }
-    if (sessionMonitors >= MAX_MONITORS_PER_SESSION) {
+    if (accountMonitors >= MAX_MONITORS_PER_SESSION) {
       return res.status(429).json({ error: `最多同時 ${MAX_MONITORS_PER_SESSION} 個監控` });
     }
 
@@ -366,8 +621,11 @@ app.post('/api/monitor', async (req, res) => {
     const monitor = {
       monitorId, storeid: sid, storeName: storeName || '', adult, child, targetTime, ntfyTopic,
       sessionId,
+      accountKey: auth.accountKey,
+      accountEmail: auth.session.email,
       earlyWindow: early,
       lateWindow: late,
+      pollInterval: pollSec,
       targetAt: targetAt.getTime(),
       status: 'waiting',
       lastWait: null,
@@ -378,6 +636,7 @@ app.post('/api/monitor', async (req, res) => {
 
     monitor.intervalId = setInterval(() => checkAndNotify(monitorId), intervalMs);
     monitors.set(monitorId, monitor);
+    persistMonitor(monitor);
     checkAndNotify(monitorId);
 
     res.json({ monitorId, status: 'waiting' });
@@ -387,15 +646,17 @@ app.post('/api/monitor', async (req, res) => {
 });
 
 function safeMonitor(m) {
-  const { intervalId, isRunning, sessionId, ntfyTopic, ...safe } = m;
+  const { intervalId, isRunning, sessionId, ntfyTopic, accountKey, accountEmail, ...safe } = m;
   return safe;
 }
 
 app.get('/api/monitor/:id', (req, res) => {
   const m = monitors.get(req.params.id);
   if (!m) return res.status(404).json({ error: 'Not found' });
-  const { sessionId } = req.query;
-  if (m.sessionId && sessionId !== m.sessionId) return res.status(403).json({ error: 'Forbidden' });
+  const auth = getSessionAuth(req.query.sessionId);
+  if (!auth) return res.status(401).json({ error: 'Session expired' });
+  const owner = m.accountKey || accountKey(m.accountEmail);
+  if (owner && owner !== auth.accountKey) return res.status(403).json({ error: 'Forbidden' });
   res.json(safeMonitor(m));
 });
 
@@ -403,23 +664,52 @@ app.delete('/api/monitor/:id', (req, res) => {
   const m = monitors.get(req.params.id);
   if (!m) return res.status(404).json({ error: 'Not found' });
   const { sessionId } = req.body || req.query;
-  if (m.sessionId && sessionId !== m.sessionId) return res.status(403).json({ error: 'Forbidden' });
+  const auth = getSessionAuth(sessionId);
+  if (!auth) return res.status(401).json({ error: 'Session expired' });
+  const owner = m.accountKey || accountKey(m.accountEmail);
+  if (owner && owner !== auth.accountKey) return res.status(403).json({ error: 'Forbidden' });
   clearInterval(m.intervalId);
   m.status = 'cancelled';
   monitors.delete(req.params.id);
+  deletePersistedMonitor(req.params.id);
   res.json(safeMonitor(m));
 });
 
 app.get('/api/monitors', (req, res) => {
-  const { sessionId } = req.query;
-  if (!sessionId) return res.json([]);
+  const auth = getSessionAuth(req.query.sessionId);
+  if (!auth) return res.json([]);
   const list = [];
   for (const [, m] of monitors) {
-    if (m.sessionId !== sessionId) continue;
+    const owner = m.accountKey || accountKey(m.accountEmail);
+    if (owner !== auth.accountKey) continue;
     list.push(safeMonitor(m));
   }
   res.json(list);
 });
+
+async function getMonitorStores() {
+  const now = Date.now();
+  if (Array.isArray(monitorStoreCache.stores) && now - monitorStoreCache.fetchedAt < MONITOR_STORE_CACHE_MS) {
+    return monitorStoreCache.stores;
+  }
+
+  if (monitorStoreCache.inFlight) return monitorStoreCache.inFlight;
+
+  monitorStoreCache.inFlight = (async () => {
+    try {
+      const qs = new URLSearchParams({ guid: uuidv4(), region: REGION });
+      const storeResult = await sushiroFetch(`/info/storelist?${qs}`);
+      if (!Array.isArray(storeResult.data)) throw new Error('invalid storelist response');
+      monitorStoreCache.stores = storeResult.data;
+      monitorStoreCache.fetchedAt = Date.now();
+      return monitorStoreCache.stores;
+    } finally {
+      monitorStoreCache.inFlight = null;
+    }
+  })();
+
+  return monitorStoreCache.inFlight;
+}
 
 async function checkAndNotify(monitorId) {
   const m = monitors.get(monitorId);
@@ -439,10 +729,8 @@ async function checkAndNotify(monitorId) {
     // Re-check after await: monitor might have been cancelled
     if (!monitors.has(monitorId) || m.status === 'cancelled') return;
 
-    const qs = new URLSearchParams({ guid: uuidv4(), region: REGION });
-    const storeResult = await sushiroFetch(`/info/storelist?${qs}`);
-    const stores = storeResult.data;
-    const store = Array.isArray(stores) ? stores.find(s => s.id === m.storeid) : null;
+    const stores = await getMonitorStores();
+    const store = stores.find(s => s.id === m.storeid);
 
     if (!store) { m.logs.push(`[${ts}] 找不到店面`); if (m.logs.length > MAX_MONITOR_LOGS) m.logs.shift(); return; }
 
@@ -524,6 +812,7 @@ async function checkAndNotify(monitorId) {
     if (m.logs.length > MAX_MONITOR_LOGS) m.logs.shift();
   } finally {
     m.isRunning = false;
+    if (monitors.has(monitorId)) persistMonitor(m);
   }
 }
 
@@ -531,22 +820,13 @@ async function checkAndNotify(monitorId) {
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions) {
-    if (session.expiresAt < now) {
-      sessions.delete(id);
-      // Cancel orphan monitors
-      for (const [mid, m] of monitors) {
-        if (m.sessionId === id && (m.status === 'waiting' || m.status === 'monitoring')) {
-          clearInterval(m.intervalId);
-          m.status = 'cancelled';
-          monitors.delete(mid);
-        }
-      }
-    }
+    if (session.expiresAt < now) sessions.delete(id);
   }
   for (const [id, m] of monitors) {
     if (new Date(m.createdAt).getTime() < now - 12 * 3600 * 1000 && ['notified', 'failed', 'cancelled'].includes(m.status)) {
       clearInterval(m.intervalId);
       monitors.delete(id);
+      deletePersistedMonitor(id);
     }
   }
   // Clean old login attempts
@@ -554,6 +834,39 @@ setInterval(() => {
     if (now > entry.resetAt) loginAttempts.delete(ip);
   }
 }, 3600000);
+
+function restorePersistedMonitors() {
+  const now = Date.now();
+  for (const [id, record] of Object.entries(db.monitors)) {
+    if (!record || !record.monitorId) {
+      delete db.monitors[id];
+      continue;
+    }
+
+    const isDone = ['notified', 'failed', 'cancelled'].includes(record.status);
+    const createdAt = new Date(record.createdAt).getTime();
+    if (isDone && Number.isFinite(createdAt) && createdAt < now - 12 * 3600 * 1000) {
+      delete db.monitors[id];
+      continue;
+    }
+
+    const pollSec = Math.max(30, Math.min(300, validInt(record.pollInterval) ?? 60));
+    const monitor = {
+      ...record,
+      pollInterval: pollSec,
+      isRunning: false,
+      logs: Array.isArray(record.logs) ? record.logs.slice(-MAX_MONITOR_LOGS) : [],
+    };
+
+    if (!isDone) {
+      monitor.intervalId = setInterval(() => checkAndNotify(monitor.monitorId), pollSec * 1000);
+    }
+    monitors.set(monitor.monitorId, monitor);
+  }
+  saveDb();
+}
+
+restorePersistedMonitors();
 
 app.listen(PORT, () => {
   console.log(`SushiRoad server running on http://localhost:${PORT}`);

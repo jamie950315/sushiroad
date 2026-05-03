@@ -577,6 +577,17 @@ input[type="time"]:focus { border-color: var(--primary); }
   margin-top: 4px;
 }
 
+.history-section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-light);
+  margin: 10px 2px 8px;
+}
+
+.account-reservation {
+  border: 1px solid rgba(42, 157, 143, 0.25);
+}
+
 /* ===== Monitor ===== */
 .monitor-list {
   max-height: calc(100vh - 200px);

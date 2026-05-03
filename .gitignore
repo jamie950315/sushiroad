@@ -2,6 +2,7 @@ node_modules/
 apk/
 *.log
 *.jsonl
+data/
 captured_requests.*
 frida_hook*.js
 capture_*.py

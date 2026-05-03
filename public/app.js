@@ -36,7 +36,7 @@ function validTimeValue(v) {
 }
 function defaultTargetTime() {
   const now = new Date();
-  now.setHours(now.getHours() + 1);
+  now.setMinutes(now.getMinutes() + 30);
   return now.toTimeString().slice(0, 5);
 }
 
@@ -44,7 +44,91 @@ const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
 function getSetting(k, d) { try { return JSON.parse(localStorage.getItem(SETTINGS_KEY))?.[k] ?? d; } catch { return d; } }
-function setSetting(k, v) { const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); s[k] = v; localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
+function setSetting(k, v) {
+  const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+  s[k] = v;
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  persistAccountSettings({ [k]: v });
+}
+function persistAccountSettings(settings) {
+  if (!state.sessionId || state.applyingRemoteSettings) return;
+  fetch('/api/settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId: state.sessionId, settings }),
+  }).catch(() => {});
+}
+function getLocalSettingsSnapshot() {
+  const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+  return {
+    ntfyTopic: validNtfyTopic(settings.ntfyTopic) ? settings.ntfyTopic : getDefaultNtfyTopic(),
+    ntfyTopicAuto: settings.ntfyTopicAuto ?? shouldUseAutoNtfyTopic(),
+    storePoll: getSetting('storePoll', 60),
+    schedulePoll: getSetting('schedulePoll', 60),
+    earlyWindow: getSetting('earlyWindow', 10),
+    lateWindow: getSetting('lateWindow', 5),
+    reservationAdult: getSetting('reservationAdult', 2),
+    reservationChild: getSetting('reservationChild', 0),
+    pinnedStoreIds: loadPinnedStoreIds(),
+    userLat: Number.isFinite(Number(settings.userLat)) ? Number(settings.userLat) : null,
+    userLon: Number.isFinite(Number(settings.userLon)) ? Number(settings.userLon) : null,
+  };
+}
+function applyAccountSettings(settings) {
+  if (!settings) return;
+  state.applyingRemoteSettings = true;
+  try {
+    const current = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...current, ...settings }));
+    if (Array.isArray(settings.pinnedStoreIds)) {
+      localStorage.setItem(PINNED_STORES_KEY, JSON.stringify(settings.pinnedStoreIds.map(String)));
+    }
+
+    applyReservationPeople(settings.reservationAdult ?? 2, settings.reservationChild ?? 0);
+    $('#target-time').value = defaultTargetTime();
+    $('#setting-store-poll').value = settings.storePoll ?? 60;
+    $('#setting-schedule-poll').value = settings.schedulePoll ?? 60;
+    $('#setting-ntfy-topic').value = validNtfyTopic(settings.ntfyTopic) ? settings.ntfyTopic : getDefaultNtfyTopic();
+    $('#setting-early-window').value = settings.earlyWindow ?? 10;
+    $('#setting-late-window').value = settings.lateWindow ?? 5;
+
+    const lat = Number(settings.userLat);
+    const lon = Number(settings.userLon);
+    if (Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+      state.userLat = lat;
+      state.userLon = lon;
+      $('#btn-location')?.classList.add('active');
+    } else {
+      state.userLat = state.userLon = null;
+      $('#btn-location')?.classList.remove('active');
+    }
+
+    hideNtfyTopicError();
+    startStorePoll();
+    renderCurrentStores();
+  } finally {
+    state.applyingRemoteSettings = false;
+  }
+}
+async function syncAccountSettings(settings, settingsExists) {
+  if (!state.sessionId) return;
+  if (settingsExists) {
+    applyAccountSettings(settings);
+    return;
+  }
+  const localSettings = getLocalSettingsSnapshot();
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: state.sessionId, settings: localSettings }),
+    });
+    const data = await res.json();
+    applyAccountSettings(data.settings || localSettings);
+  } catch {
+    applyAccountSettings(settings || localSettings);
+  }
+}
 function shouldUseAutoNtfyTopic() {
   const topic = getSetting('ntfyTopic', '');
   const auto = getSetting('ntfyTopicAuto', null);
@@ -115,13 +199,17 @@ function applyReservationPeople(adult, child) {
 function loadPinnedStoreIds() {
   try {
     const ids = JSON.parse(localStorage.getItem(PINNED_STORES_KEY)) || [];
-    return Array.isArray(ids) ? ids.map(String) : [];
+    if (Array.isArray(ids) && ids.length) return ids.map(String);
+    const synced = getSetting('pinnedStoreIds', []);
+    return Array.isArray(synced) ? synced.map(String) : [];
   } catch {
     return [];
   }
 }
 function savePinnedStoreIds(ids) {
-  localStorage.setItem(PINNED_STORES_KEY, JSON.stringify([...new Set(ids.map(String))]));
+  const normalized = [...new Set(ids.map(String))];
+  localStorage.setItem(PINNED_STORES_KEY, JSON.stringify(normalized));
+  setSetting('pinnedStoreIds', normalized);
 }
 function isPinnedStore(id) {
   return loadPinnedStoreIds().includes(String(id));
@@ -363,8 +451,8 @@ function bindEvents() {
   $('#btn-clear-history').addEventListener('click', () => { if (confirm('清除所有紀錄？')) { saveHistory([]); renderHistory(); } });
   $('#setting-store-poll').addEventListener('change', e => { setSetting('storePoll', Number(e.target.value)); startStorePoll(); });
   $('#setting-schedule-poll').addEventListener('change', e => setSetting('schedulePoll', Number(e.target.value)));
-  $('#target-time').addEventListener('change', e => {
-    if (validTimeValue(e.target.value)) setSetting('targetTime', e.target.value);
+  $('#target-time').addEventListener('focus', e => {
+    if (!validTimeValue(e.target.value)) e.target.value = defaultTargetTime();
   });
   $('#setting-ntfy-topic').addEventListener('input', () => hideNtfyTopicError());
   $('#setting-ntfy-topic').addEventListener('blur', e => {
@@ -388,8 +476,7 @@ function bindEvents() {
 
 function initSettings() {
   applyReservationPeople(getSetting('reservationAdult', 2), getSetting('reservationChild', 0));
-  const savedTargetTime = getSetting('targetTime', '');
-  $('#target-time').value = validTimeValue(savedTargetTime) ? savedTargetTime : defaultTargetTime();
+  $('#target-time').value = defaultTargetTime();
   $('#setting-store-poll').value = getSetting('storePoll', 60);
   $('#setting-schedule-poll').value = getSetting('schedulePoll', 60);
   const storedTopic = getSetting('ntfyTopic', '');
@@ -418,7 +505,6 @@ async function handleSubmit() {
 
   const targetTime = $('#target-time').value;
   if (!targetTime) return alert('請選擇用餐時間');
-  if (validTimeValue(targetTime)) setSetting('targetTime', targetTime);
   saveReservationPeople();
 
   $('#btn-submit').disabled = true;
@@ -610,8 +696,16 @@ async function startMonitoring(targetTime) {
 // ==================== History ====================
 function renderHistory() {
   const history = loadHistory();
+  if (state.sessionId) {
+    renderAccountReservations(history);
+    return;
+  }
   if (!history.length) { $('#history-list').innerHTML = '<div class="empty-state">尚無紀錄</div>'; $('#btn-clear-history').style.display = 'none'; return; }
   $('#btn-clear-history').style.display = 'block';
+  $('#history-list').innerHTML = renderLocalHistoryCards(history);
+}
+
+function renderLocalHistoryCards(history) {
   const statusMap = { active: ['進行中','pending'], success: ['已完成','success'], failed: ['失敗','failed'], cancelled: ['已取消','cancelled'] };
   let html = '';
   for (const e of history) {
@@ -622,7 +716,52 @@ function renderHistory() {
       <div class="h-detail">${e.adult} 大 ${e.child} 小 ${e.date && e.time ? '| '+esc(e.date)+' '+esc(e.time) : ''}</div>
       <div class="h-time">${new Date(e.createdAt).toLocaleString('zh-TW')}</div></div>`;
   }
-  $('#history-list').innerHTML = html;
+  return html;
+}
+
+async function renderAccountReservations(history = loadHistory()) {
+  $('#btn-clear-history').style.display = history.length ? 'block' : 'none';
+  $('#history-list').innerHTML = '<div class="loading"><div class="spinner"></div><p>載入中...</p></div>';
+  try {
+    const res = await fetch('/api/reservations?sessionId=' + encodeURIComponent(state.sessionId || ''));
+    if (!res.ok) throw new Error('load failed');
+    const reservations = await res.json();
+    let html = '';
+    if (reservations.length) {
+      html += '<div class="history-section-title">帳號目前預約</div>';
+      html += reservations.map(reservationCard).join('');
+    }
+    if (history.length) {
+      html += '<div class="history-section-title">本裝置紀錄</div>';
+      html += renderLocalHistoryCards(history);
+    }
+    $('#history-list').innerHTML = html || '<div class="empty-state">尚無紀錄</div>';
+  } catch {
+    $('#history-list').innerHTML = history.length ? renderLocalHistoryCards(history) : '<div class="empty-state">載入失敗</div>';
+  }
+}
+
+function reservationCard(r) {
+  const time = r.time ? String(r.time).replace(/(\d{2})(\d{2})\d{2}/, '$1:$2') : '';
+  const date = r.date ? String(r.date).replace(/(\d{4})(\d{2})(\d{2})/, '$1/$2/$3') : '';
+  return `<div class="history-card account-reservation">
+    <div class="h-top"><span class="h-store">${esc(r.storeName || '壽司郎')}</span><span class="h-status pending">進行中</span></div>
+    ${r.ticketNo ? `<div class="h-ticket">#${esc(r.ticketNo)}</div>` : ''}
+    ${r.checkinCode ? `<div class="h-detail" style="color:var(--success);font-weight:600">報到代碼: ${esc(r.checkinCode)}</div>` : ''}
+    <div class="h-detail">${date && time ? esc(date) + ' ' + esc(time) : ''}</div>
+    <div class="m-actions"><button class="btn btn-danger btn-sm" onclick="cancelReservation('${escJs(r.ticketId)}','${escJs(r.storeid || '')}')">取消預約</button></div>
+  </div>`;
+}
+
+async function cancelReservation(ticketId, storeid) {
+  if (!state.sessionId || !ticketId) return;
+  if (!confirm('取消預約？')) return;
+  await fetch('/api/ticket/cancel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId: state.sessionId, ticketId, storeid }),
+  });
+  renderHistory();
 }
 
 // ==================== Monitor Page ====================
@@ -700,8 +839,11 @@ async function doLogin() {
       state.sessionId = data.sessionId;
       localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId: data.sessionId, email: data.email }));
       saveAccountEmail(data.email);
-      applyLoginNtfyTopic(data.ntfyTopic || makeTopic(data.email));
+      await syncAccountSettings(data.settings, data.settingsExists);
       updateLoginUI(data.email); hideLoginDialog();
+      updateMonitorBadge();
+      if (state.activeTab === 'history') renderHistory();
+      if (state.activeTab === 'monitor') renderMonitor();
     } else {
       
       $('#login-error').textContent = !res.ok ? '帳號或密碼錯誤' : (data.error || '登入失敗');
@@ -714,6 +856,9 @@ async function doLogin() {
 function logout() {
   if (state.sessionId) fetch('/api/auth/session/' + state.sessionId, { method: 'DELETE' }).catch(() => {});
   state.sessionId = null; localStorage.removeItem(SESSION_KEY); updateLoginUI(null);
+  updateMonitorBadge();
+  if (state.activeTab === 'history') renderHistory();
+  if (state.activeTab === 'monitor') renderMonitor();
 }
 
 function updateLoginUI(email) {
@@ -738,7 +883,10 @@ async function restoreSession() {
         const email = saved.email || data.email || '';
         if (email) {
           saveAccountEmail(email);
-          applyLoginNtfyTopic(data.ntfyTopic || makeTopic(email));
+          await syncAccountSettings(data.settings, data.settingsExists);
+          updateMonitorBadge();
+          if (state.activeTab === 'history') renderHistory();
+          if (state.activeTab === 'monitor') renderMonitor();
         }
       }
       else {
@@ -760,6 +908,7 @@ window.doLogin = doLogin;
 window.logout = logout;
 window.requestLocation = requestLocation;
 window.cancelMonitor = cancelMonitor;
+window.cancelReservation = cancelReservation;
 window.pickSlot = pickSlot;
 window.startMonitoringFromUI = startMonitoringFromUI;
 window.togglePinStore = togglePinStore;
@@ -781,6 +930,10 @@ if (Number.isFinite(savedLat) && Number.isFinite(savedLon) && savedLat >= -90 &&
   setSetting('userLon', null);
 }
 
-init();
-restoreSession();
-updateMonitorBadge();
+async function boot() {
+  await init();
+  await restoreSession();
+  updateMonitorBadge();
+}
+
+boot();

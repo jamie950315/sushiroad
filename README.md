@@ -7,6 +7,8 @@ A web-based reservation and wait-time monitoring tool for **Sushiro Taiwan (壽�
 - **Store Browser** — Browse all 56 Taiwan Sushiro locations with real-time queue status, geolocation-based distance sorting (auto-saved), and search
 - **Smart Reservation** — Input your desired dining time; the system checks for available slots within ±15 minutes and lets you pick, or falls back to monitoring mode
 - **Wait-Time Monitoring** — When no reservation slot is available, monitors the store's queue in real-time and sends a push notification via [ntfy.sh](https://ntfy.sh) when it's the optimal time to take a ticket in the app
+- **Cross-Device Account Sync** — Active reservations, monitors, and user settings are tied to the logged-in Sushiro account, so another device signed into the same account can view, cancel, and reuse the same configuration
+- **Shared Monitor Polling** — Active monitors share one store-list fetch per 30 seconds to reduce external API traffic
 - **Configurable Timing** — Set how many minutes early or late you're willing to arrive
 - **Auto-Setup** — ntfy topic auto-generated from your email on login; geolocation persisted across sessions
 
@@ -40,6 +42,7 @@ User selects store + time (e.g. 14:30)
                       ▼
               Poll wait time
               every 30-120s
+              (shared cache)
                       │
                       ▼
               wait + now ≈ target?
@@ -87,6 +90,7 @@ The Sushiro CRM API was reverse-engineered from the official Flutter/Dart mobile
 
 - **Backend**: Node.js + Express (port 3737)
 - **Frontend**: Vanilla HTML/CSS/JS (mobile-first UI)
+- **Storage**: Lightweight local JSON database for account-scoped monitors and reservation metadata
 - **Push Notifications**: [ntfy.sh](https://ntfy.sh) (JSON API for UTF-8 support)
 - **Deployment**: systemd service + Cloudflare Tunnel
 - **Platform**: Raspberry Pi 5
@@ -116,7 +120,7 @@ Add to `/etc/cloudflared/config.yml`:
   service: http://localhost:3737
 ```
 
-## Settings (Browser-Persisted)
+## Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -127,11 +131,14 @@ Add to `/etc/cloudflared/config.yml`:
 | 店鋪刷新 | 60s | How often to refresh store list |
 | 地理位置 | Auto-saved | GPS coordinates persisted across sessions |
 
+When logged in, settings are synced by Sushiro account. Before login, the browser keeps local settings and uploads them to the account on first sync.
+
+Runtime account data is stored server-side in `data/sushiroad.db.json` by default. Override with `SUSHIROAD_DB=/path/to/file.json` if needed.
+
 ## Limitations
 
 - **"Go Now" (立即前往)** ticket creation via `/remote/newticket` requires a hidden device registration flow embedded in the Flutter app's compiled Dart code (BoringSSL with stripped symbols). This endpoint cannot be called from outside the app. The web service uses `newreservation` instead.
 - Reservations book a specific time slot (earliest usually 60-90 min away), unlike "Go Now" which joins the live queue immediately.
-- Cancel from web only — reservations created via web cannot be cancelled from the mobile app (different device GUID).
 
 ## License
 
