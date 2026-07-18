@@ -679,6 +679,8 @@ async function startMonitoring(targetTime) {
     <div class="status-subtext">${esc(state.selectedStore.name)} | 目標: ${esc(targetTime)}</div>
     <div class="status-subtext">無可用預約時段，系統將監控等候時間</div>
     <div class="status-subtext">當最佳抽號時機到來時，會透過 ntfy 通知您</div>
+    <div class="status-subtext">通知 Topic：ntfy.sh/${esc(data.ntfyTopic || ntfyTopic)}</div>
+    ${data.startNotificationSent ? '<div class="status-subtext">已發送監控啟動通知</div>' : '<div class="status-subtext warning-text">監控已啟動，但啟動通知暫時無法送達</div>'}
     <div class="status-subtext pulse" style="margin-top:8px">監控 ID: ${esc(data.monitorId)}</div>`;
   $('#btn-cancel-ticket').style.display = 'inline-block';
   $('#btn-cancel-ticket').textContent = '取消監控';
@@ -780,6 +782,7 @@ async function renderMonitor() {
           <div class="m-stat"><div class="m-stat-value">${esc(m.targetTime)}</div><div class="m-stat-label">目標時間</div></div>
           <div class="m-stat"><div class="m-stat-value">${m.lastWait != null ? m.lastWait+'分' : '--'}</div><div class="m-stat-label">目前等候</div></div>
         </div>
+        <div class="m-topic"><span>通知 Topic</span><span class="m-topic-value">ntfy.sh/${esc(m.ntfyTopic || '未提供')}</span></div>
         ${m.logs && m.logs.length ? `<div class="logs" style="margin-top:10px;max-height:100px">${m.logs.slice(-3).map(l=>`<div class="log-entry">${esc(l)}</div>`).join('')}</div>` : ''}
         <div class="m-updated">${new Date().toLocaleTimeString('zh-TW')} 更新</div>
         <div class="m-actions"><button class="btn btn-danger btn-sm" onclick="cancelMonitor('${escJs(m.monitorId)}')">${m.status === 'monitoring' || m.status === 'waiting' ? '取消監控' : '刪除'}</button></div>

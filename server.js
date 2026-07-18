@@ -10,6 +10,7 @@ const API_BASE = 'https://crm-tw.akindo-sushiro.co.jp/api/2.0';
 const REGION = 'TW';
 const UA = 'Dart/3.6 (dart:io)';
 const FETCH_TIMEOUT_MS = 12000;
+const NTFY_TIMEOUT_MS = 10000;
 const MAX_MONITORS_PER_SESSION = 3;
 const MAX_MONITOR_LOGS = 100;
 const MONITOR_STORE_CACHE_MS = 30000;
@@ -208,6 +209,22 @@ function makeNtfyTopic(email) {
   const rawPrefix = String(email || '').split('@')[0] || 'user';
   const prefix = formatNtfyTopic(rawPrefix, 8) || `user-${uuidv4().slice(0, 6)}`;
   return `${prefix}${suffix}`;
+}
+
+async function sendNtfyNotification(topic, notification) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), NTFY_TIMEOUT_MS);
+  try {
+    const response = await fetch('https://ntfy.sh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic, ...notification }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`ntfy HTTP ${response.status}`);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // --- Helper: fetch from Sushiro API with timeout ---
@@ -637,16 +654,31 @@ app.post('/api/monitor', async (req, res) => {
     monitor.intervalId = setInterval(() => checkAndNotify(monitorId), intervalMs);
     monitors.set(monitorId, monitor);
     persistMonitor(monitor);
+
+    let startNotificationSent = false;
+    try {
+      await sendNtfyNotification(monitor.ntfyTopic, {
+        title: `壽司郎 ${monitor.storeName || `店號 ${monitor.storeid}`} - 監控已啟動`,
+        message: `📡 監控已成功啟動\n⏱️ 目標時間 ${monitor.targetTime}\n🆔 監控 ID ${monitor.monitorId}\n🔔 Topic: ${monitor.ntfyTopic}`,
+        priority: 3,
+        tags: ['sushi', 'satellite'],
+      });
+      startNotificationSent = true;
+      monitor.logs.push(`[${new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Taipei' })}] 已發送監控啟動通知至 ${monitor.ntfyTopic}`);
+    } catch (err) {
+      monitor.logs.push(`[${new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Taipei' })}] 監控已啟動，但啟動通知發送失敗: ${err.message}`);
+    }
+    persistMonitor(monitor);
     checkAndNotify(monitorId);
 
-    res.json({ monitorId, status: 'waiting' });
+    res.json({ monitorId, status: 'waiting', ntfyTopic: monitor.ntfyTopic, startNotificationSent });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 function safeMonitor(m) {
-  const { intervalId, isRunning, sessionId, ntfyTopic, accountKey, accountEmail, ...safe } = m;
+  const { intervalId, isRunning, sessionId, accountKey, accountEmail, ...safe } = m;
   return safe;
 }
 
@@ -784,16 +816,11 @@ async function checkAndNotify(monitorId) {
       if (!monitors.has(monitorId) || m.status === 'cancelled') return;
 
       try {
-        await fetch(`https://ntfy.sh`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            topic: m.ntfyTopic,
-            title: notifyTitle,
-            message: notifyMessage,
-            priority: 5,
-            tags: ['sushi', 'bell'],
-          }),
+        await sendNtfyNotification(m.ntfyTopic, {
+          title: notifyTitle,
+          message: notifyMessage,
+          priority: 5,
+          tags: ['sushi', 'bell'],
         });
         m.status = 'notified';
         m.logs.push(`[${ts}] 已發送 ntfy 通知`);
@@ -817,7 +844,7 @@ async function checkAndNotify(monitorId) {
 }
 
 // --- Cleanup ---
-setInterval(() => {
+const cleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions) {
     if (session.expiresAt < now) sessions.delete(id);
@@ -834,6 +861,7 @@ setInterval(() => {
     if (now > entry.resetAt) loginAttempts.delete(ip);
   }
 }, 3600000);
+cleanupInterval.unref();
 
 function restorePersistedMonitors() {
   const now = Date.now();
@@ -868,6 +896,10 @@ function restorePersistedMonitors() {
 
 restorePersistedMonitors();
 
-app.listen(PORT, () => {
-  console.log(`SushiRoad server running on http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`SushiRoad server running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = { app, monitors, sessions, safeMonitor, sendNtfyNotification };

@@ -683,6 +683,29 @@ input[type="time"]:focus { border-color: var(--primary); }
   text-align: right;
 }
 
+.monitor-card .m-topic {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: #f8f9fa;
+  color: var(--text-light);
+  font-size: 12px;
+}
+
+.monitor-card .m-topic-value {
+  color: var(--text);
+  font-family: monospace;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.warning-text {
+  color: #b26a00;
+}
+
 .monitor-card .m-actions {
   margin-top: 10px;
   display: flex;
