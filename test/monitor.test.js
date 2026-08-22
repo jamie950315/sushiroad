@@ -88,6 +88,7 @@ test('monitor creation sends a start notification and exposes its topic', { conc
   assert.equal(created.body.ntfyTopic, 'success-sushiroad');
   assert.equal(created.body.startNotificationSent, true);
   assert.equal(payloads[0].topic, 'success-sushiroad');
+  assert.equal(payloads[0].click, 'shortcuts://run-shortcut?name=Open%20Sushiro');
   assert.match(payloads[0].title, /測試店.*監控已啟動/);
   assert.match(payloads[0].message, new RegExp(created.body.monitorId));
 

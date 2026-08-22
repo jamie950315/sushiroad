@@ -455,6 +455,7 @@ input[type="time"]:focus { border-color: var(--primary); }
 .btn-danger { background: var(--danger); color: white; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-sm { padding: 8px 14px; font-size: 13px; flex: none; }
+.shortcut-link { display: inline-block; text-align: center; text-decoration: none; white-space: nowrap; }
 
 /* ===== Status panel ===== */
 .status-panel {

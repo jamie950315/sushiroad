@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 3737;
 
 const API_BASE = 'https://crm-tw.akindo-sushiro.co.jp/api/2.0';
 const REGION = 'TW';
+const SUSHIRO_SHORTCUT_URL = 'shortcuts://run-shortcut?name=Open%20Sushiro';
 const UA = 'Dart/3.6 (dart:io)';
 const FETCH_TIMEOUT_MS = 12000;
 const NTFY_TIMEOUT_MS = 10000;
@@ -218,7 +219,7 @@ async function sendNtfyNotification(topic, notification) {
     const response = await fetch('https://ntfy.sh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ topic, ...notification }),
+      body: JSON.stringify({ topic, ...notification, click: SUSHIRO_SHORTCUT_URL }),
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`ntfy HTTP ${response.status}`);

@@ -107,9 +107,13 @@ Environment: Node.js 20+. Runs on port 3737 by default (`PORT` env var to overri
 ### ntfy.sh Setup
 
 1. Install the [ntfy app](https://ntfy.sh) on your phone
-2. Login to SushiRoad — a topic is auto-generated from your email
-3. Subscribe to that topic in the ntfy app (shown in Settings)
-4. You can customize the topic name in Settings
+2. On iPhone, install the [Open Sushiro shortcut](https://www.icloud.com/shortcuts/70cc5ba70a92493ca58c2f23b1fca517)
+3. Keep the shortcut name exactly as `Open Sushiro`
+4. Login to SushiRoad — a topic is auto-generated from your email
+5. Subscribe to that topic in the ntfy app (shown in Settings)
+6. You can customize the topic name in Settings
+
+On iPhone, tapping a SushiRoad notification runs the shortcut and opens the Taiwan Sushiro app. If the shortcut is renamed or removed, notifications can no longer open the app.
 
 ### Cloudflare Tunnel
 
