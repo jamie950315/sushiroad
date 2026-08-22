@@ -20,7 +20,7 @@ npm start        # production
 npm run dev      # development (--watch)
 ```
 
-No build step. No tests. Static files served directly by Express.
+No build step. Tests run with Node's built-in test runner. Static files are served directly by Express.
 
 ## Key Architecture Decisions
 
@@ -29,6 +29,8 @@ No build step. No tests. Static files served directly by Express.
 - Login endpoint uses `application/x-www-form-urlencoded` (not JSON)
 - Region is uppercase `TW`
 - User-Agent must be `Dart/3.6 (dart:io)` to match the Flutter app
+- SushiRoad login sessions last 365 days and survive service restarts
+- Persistent sessions store only a SHA-256 token hash and an AES-256-GCM encrypted Basic Auth credential
 
 ### Reservation Flow
 - Uses `/remote_auth/newreservation` (not `/remote/newticket` which requires app-level device registration)
@@ -38,18 +40,26 @@ No build step. No tests. Static files served directly by Express.
 - Smart slot picker: exact match → auto-reserve; ±15min nearby → user picks; none → monitoring mode
 
 ### Monitoring
-- Monitors are in-memory (Map), not persisted
+- Monitors are persisted and restored after service restarts
+- Monitoring requires an explicit Taipei `targetDate` and `targetTime`; past targets are never rolled into the next day
+- Targets sooner than the store's current wait are rejected before a monitor is created
 - Each monitor polls store wait time at configurable intervals (30-300s)
 - Configurable early/late window (how many minutes early or late is acceptable)
 - Notification logic: `wait=0` → "go eat directly", `wait>0 && now+wait≈target` → "go take ticket"
 - ntfy.sh notifications use JSON API to support UTF-8 titles
 - Auto-generates ntfy topic from user email on login (first 8 chars + `-sushiroad`)
+- Guests can use notification-only monitoring with a device token stored in localStorage
+- Guest topic names receive a stable `_XXXX` uppercase alphanumeric suffix per chosen base name and device; new suffixes exclude `0`, `1`, `O`, `I`, and `L`
+- Guest setup and manual account login show the final Topic confirmation dialog before continuing
+- Once guest setup is complete, the device remembers guest notification mode and skips future login/topic prompts
 
 ### Security
 - Per-IP login rate limiting (5/min)
-- Monitor endpoints require sessionId ownership
-- ntfyTopic validated with regex `^[a-zA-Z0-9._-]{1,64}$`
-- Max 3 monitors per session
+- Monitor endpoints accept either account Session ownership or a device-scoped guest Bearer token
+- Session tokens use 32 random bytes; raw tokens and Basic Auth values are never written to the database
+- Runtime data is written with owner-only permissions, and persisted monitor records exclude session IDs
+- ntfyTopic validated with regex `^[a-zA-Z0-9_-]{1,64}$`
+- Max 3 active monitors per account or guest device
 - URL params validated with strict integer regex
 - Session cleanup cancels orphan monitors
 - Geolocation coordinates validated before restoring from localStorage

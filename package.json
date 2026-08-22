@@ -1,6 +1,6 @@
 {
   "name": "sushiroad",
-  "version": "1.0.0",
+  "version": "2.5.0",
   "description": "Sushiro Taiwan smart queue/reservation web service",
   "main": "server.js",
   "scripts": {

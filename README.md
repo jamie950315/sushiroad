@@ -7,6 +7,7 @@ A web-based reservation and wait-time monitoring tool for **Sushiro Taiwan (壽�
 - **Store Browser** — Browse all 56 Taiwan Sushiro locations with real-time queue status, geolocation-based distance sorting (auto-saved), and search
 - **Smart Reservation** — Input your desired dining time; the system checks for available slots within ±15 minutes and lets you pick, or falls back to monitoring mode
 - **Wait-Time Monitoring** — When no reservation slot is available, monitors the store's queue in real-time and sends a push notification via [ntfy.sh](https://ntfy.sh) when it's the optimal time to take a ticket in the app
+- **Explicit Date and Time** — Select the intended dining date and time; past targets and targets sooner than the current queue are rejected instead of being silently moved to tomorrow
 - **Cross-Device Account Sync** — Active reservations, monitors, and user settings are tied to the logged-in Sushiro account, so another device signed into the same account can view, cancel, and reuse the same configuration
 - **Shared Monitor Polling** — Active monitors share one store-list fetch per 30 seconds to reduce external API traffic
 - **Configurable Timing** — Set how many minutes early or late you're willing to arrive
@@ -136,6 +137,10 @@ Add to `/etc/cloudflared/config.yml`:
 | 地理位置 | Auto-saved | GPS coordinates persisted across sessions |
 
 When logged in, settings are synced by Sushiro account. Before login, the browser keeps local settings and uploads them to the account on first sync.
+
+Login sessions remain valid for 365 days and survive service restarts. Session tokens are stored as hashes, and the Sushiro authorization credential is encrypted at rest. Logging out immediately removes the persisted session.
+
+If you continue without an account, SushiRoad shows and appends a stable four-character uppercase alphanumeric suffix to your chosen ntfy.sh topic name. New suffixes exclude the easily confused characters `0`, `1`, `O`, `I`, and `L`. The complete topic, private monitoring token, and guest-mode preference are saved only in that browser. After the first guest setup, future monitoring starts use the saved guest mode directly instead of asking about login or the topic again. After guest setup or account login, a confirmation dialog displays the final topic with Copy and OK buttons before continuing. Guest mode sends notifications and lets the same device manage its monitors, but it does not check reservation slots or make automatic reservations.
 
 Runtime account data is stored server-side in `data/sushiroad.db.json` by default. Override with `SUSHIROAD_DB=/path/to/file.json` if needed.
 
