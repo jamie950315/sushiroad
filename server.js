@@ -1,5 +1,6 @@
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
@@ -12,6 +13,7 @@ const SUSHIRO_SHORTCUT_URL = 'shortcuts://run-shortcut?name=Open%20Sushiro';
 const UA = 'Dart/3.6 (dart:io)';
 const FETCH_TIMEOUT_MS = 12000;
 const NTFY_TIMEOUT_MS = 10000;
+const SESSION_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 const MAX_MONITORS_PER_SESSION = 3;
 const MAX_MONITOR_LOGS = 100;
 const MONITOR_STORE_CACHE_MS = 30000;
@@ -49,7 +51,7 @@ const monitorStoreCache = {
 
 // --- Lightweight file DB ---
 function createEmptyDb() {
-  return { version: 1, monitors: {}, reservations: {}, settings: {} };
+  return { version: 3, sessions: {}, monitors: {}, reservations: {}, settings: {} };
 }
 
 function loadDb() {
@@ -57,7 +59,8 @@ function loadDb() {
     if (!fs.existsSync(DB_PATH)) return createEmptyDb();
     const parsed = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
     return {
-      version: 1,
+      version: 3,
+      sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
       monitors: parsed.monitors && typeof parsed.monitors === 'object' ? parsed.monitors : {},
       reservations: parsed.reservations && typeof parsed.reservations === 'object' ? parsed.reservations : {},
       settings: parsed.settings && typeof parsed.settings === 'object' ? parsed.settings : {},
@@ -71,11 +74,118 @@ function loadDb() {
 let db = loadDb();
 
 function saveDb() {
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  const dbDir = path.dirname(DB_PATH);
+  fs.mkdirSync(dbDir, { recursive: true, mode: 0o700 });
   const tmpPath = `${DB_PATH}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(db, null, 2));
+  fs.writeFileSync(tmpPath, JSON.stringify(db, null, 2), { mode: 0o600 });
+  fs.chmodSync(tmpPath, 0o600);
   fs.renameSync(tmpPath, DB_PATH);
+  fs.chmodSync(DB_PATH, 0o600);
 }
+
+function loadSessionEncryptionKey() {
+  if (process.env.SUSHIROAD_SESSION_SECRET) {
+    return crypto.createHash('sha256').update(process.env.SUSHIROAD_SESSION_SECRET).digest();
+  }
+
+  if (process.env.CREDENTIALS_DIRECTORY) {
+    const credentialPath = path.join(process.env.CREDENTIALS_DIRECTORY, 'sushiroad_session_key');
+    const credential = fs.readFileSync(credentialPath);
+    if (credential.length < 32) throw new Error('sushiroad_session_key must contain at least 32 bytes');
+    return crypto.createHash('sha256').update(credential).digest();
+  }
+
+  const keyPath = process.env.SUSHIROAD_SESSION_KEY_FILE || `${DB_PATH}.session-key`;
+  if (!fs.existsSync(keyPath)) {
+    if (Object.keys(db.sessions).length > 0) {
+      throw new Error(`Session key missing at ${keyPath}; refusing to discard persisted sessions`);
+    }
+    fs.mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(keyPath, crypto.randomBytes(32), { mode: 0o600, flag: 'wx' });
+  }
+  fs.chmodSync(keyPath, 0o600);
+  const key = fs.readFileSync(keyPath);
+  if (key.length !== 32) throw new Error(`Session key at ${keyPath} must be exactly 32 bytes`);
+  return key;
+}
+
+const sessionEncryptionKey = loadSessionEncryptionKey();
+
+function sessionStorageKey(sessionId) {
+  return crypto.createHash('sha256').update(String(sessionId || '')).digest('hex');
+}
+
+function encryptSessionAuth(storageKey, basicAuth) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', sessionEncryptionKey, iv);
+  cipher.setAAD(Buffer.from(storageKey));
+  const ciphertext = Buffer.concat([cipher.update(basicAuth, 'utf8'), cipher.final()]);
+  return {
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+  };
+}
+
+function decryptSessionAuth(storageKey, encryptedAuth) {
+  if (!encryptedAuth?.iv || !encryptedAuth?.tag || !encryptedAuth?.ciphertext) {
+    throw new Error('invalid encrypted session');
+  }
+  const decipher = crypto.createDecipheriv(
+    'aes-256-gcm',
+    sessionEncryptionKey,
+    Buffer.from(encryptedAuth.iv, 'base64'),
+  );
+  decipher.setAAD(Buffer.from(storageKey));
+  decipher.setAuthTag(Buffer.from(encryptedAuth.tag, 'base64'));
+  return Buffer.concat([
+    decipher.update(Buffer.from(encryptedAuth.ciphertext, 'base64')),
+    decipher.final(),
+  ]).toString('utf8');
+}
+
+function persistSession(storageKey, session) {
+  db.sessions[storageKey] = {
+    email: session.email,
+    customerId: session.customerId,
+    expiresAt: session.expiresAt,
+    encryptedAuth: encryptSessionAuth(storageKey, session.basicAuth),
+  };
+  saveDb();
+}
+
+function deleteSessionByStorageKey(storageKey) {
+  sessions.delete(storageKey);
+  if (db.sessions[storageKey]) {
+    delete db.sessions[storageKey];
+    saveDb();
+  }
+}
+
+function restorePersistedSessions() {
+  const now = Date.now();
+  let changed = false;
+  for (const [storageKey, record] of Object.entries(db.sessions)) {
+    if (!/^[a-f0-9]{64}$/.test(storageKey) || !record?.email || !Number.isFinite(record.expiresAt) || record.expiresAt <= now) {
+      delete db.sessions[storageKey];
+      changed = true;
+      continue;
+    }
+    try {
+      sessions.set(storageKey, {
+        basicAuth: decryptSessionAuth(storageKey, record.encryptedAuth),
+        email: record.email,
+        customerId: record.customerId,
+        expiresAt: record.expiresAt,
+      });
+    } catch (err) {
+      throw new Error(`Unable to decrypt persisted sessions; check the configured session key (${err.message})`);
+    }
+  }
+  if (changed) saveDb();
+}
+
+restorePersistedSessions();
 
 function accountKey(email) {
   return String(email || '').trim().toLowerCase();
@@ -117,6 +227,22 @@ function markReservationCancelled(account, ticketId) {
 
 function validTimeValue(v) {
   return typeof v === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
+}
+
+function validDateValue(v) {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const timestamp = Date.parse(`${v}T12:00:00+08:00`);
+  return Number.isFinite(timestamp) && new Date(timestamp + 8 * 3600000).toISOString().slice(0, 10) === v;
+}
+
+function targetTimestamp(targetDate, targetTime) {
+  if (!validDateValue(targetDate) || !validTimeValue(targetTime)) return null;
+  const timestamp = Date.parse(`${targetDate}T${targetTime}:00+08:00`);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function taipeiDateFromTimestamp(timestamp) {
+  return new Date(timestamp).toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
 }
 
 function defaultAccountSettings(email) {
@@ -260,8 +386,13 @@ function makeBasicAuth(email, password) {
 }
 
 function getAuthHeaders(sessionId) {
-  const session = sessions.get(sessionId);
-  if (!session || session.expiresAt < Date.now()) return null;
+  const storageKey = sessionStorageKey(sessionId);
+  const session = sessions.get(storageKey);
+  if (!session) return null;
+  if (session.expiresAt < Date.now()) {
+    deleteSessionByStorageKey(storageKey);
+    return null;
+  }
   return { headers: { 'Authorization': `Basic ${session.basicAuth}` }, session };
 }
 
@@ -288,15 +419,23 @@ app.post('/api/auth/login', async (req, res) => {
     });
 
     if (result.status === 200 && result.data?.status === 'SUCCESS') {
-      const sessionId = uuidv4();
+      const sessionId = crypto.randomBytes(32).toString('base64url');
+      const storageKey = sessionStorageKey(sessionId);
       const key = accountKey(email);
       const accountSettings = getAccountSettings(key, email);
-      sessions.set(sessionId, {
+      const session = {
         basicAuth: makeBasicAuth(email, password),
         email,
         customerId: result.data.customerid,
-        expiresAt: Date.now() + 24 * 3600 * 1000,
-      });
+        expiresAt: Date.now() + SESSION_TTL_MS,
+      };
+      sessions.set(storageKey, session);
+      try {
+        persistSession(storageKey, session);
+      } catch (err) {
+        sessions.delete(storageKey);
+        throw err;
+      }
       res.json({
         sessionId,
         email,
@@ -314,8 +453,9 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.get('/api/auth/session/:sessionId', (req, res) => {
-  const session = sessions.get(req.params.sessionId);
-  if (!session || session.expiresAt < Date.now()) return res.status(401).json({ valid: false });
+  const auth = getSessionAuth(req.params.sessionId);
+  if (!auth) return res.status(401).json({ valid: false });
+  const { session } = auth;
   const accountSettings = getAccountSettings(accountKey(session.email), session.email);
   res.json({
     valid: true,
@@ -327,8 +467,7 @@ app.get('/api/auth/session/:sessionId', (req, res) => {
 });
 
 app.delete('/api/auth/session/:sessionId', (req, res) => {
-  const sid = req.params.sessionId;
-  sessions.delete(sid);
+  deleteSessionByStorageKey(sessionStorageKey(req.params.sessionId));
   res.json({ success: true });
 });
 
@@ -847,8 +986,8 @@ async function checkAndNotify(monitorId) {
 // --- Cleanup ---
 const cleanupInterval = setInterval(() => {
   const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (session.expiresAt < now) sessions.delete(id);
+  for (const [storageKey, session] of sessions) {
+    if (session.expiresAt < now) deleteSessionByStorageKey(storageKey);
   }
   for (const [id, m] of monitors) {
     if (new Date(m.createdAt).getTime() < now - 12 * 3600 * 1000 && ['notified', 'failed', 'cancelled'].includes(m.status)) {
@@ -903,4 +1042,7 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, monitors, sessions, safeMonitor, sendNtfyNotification };
+module.exports = {
+  app, monitors, sessions, safeMonitor, sendNtfyNotification, SESSION_TTL_MS,
+  sessionStorageKey, targetTimestamp, monitorStoreCache,
+};
