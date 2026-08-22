@@ -2,12 +2,17 @@ const state = {
   stores: [], selectedStore: null, adult: 2, child: 0,
   activeTab: 'stores', sessionId: null,
   pollInterval: null, storePollInterval: null, monitorInterval: null,
+  pendingSubmit: null, submitFlow: 'idle', loginContext: 'settings',
+  authReady: false,
+  guestTopicDraftBase: null, guestTopicNewSuffix: '', topicConfirmation: null,
 };
 const SESSION_KEY = 'sushiroad_session';
 const SETTINGS_KEY = 'sushiroad_settings';
 const HISTORY_KEY = 'sushiroad_history';
 const PINNED_STORES_KEY = 'sushiroad_pinned_stores';
 const ACCOUNT_EMAIL_KEY = 'sushiroad_account_email';
+const GUEST_TOKEN_KEY = 'sushiroad_guest_monitor_token';
+const GUEST_TOPIC_SUFFIX_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const SEAT_LABEL = { TABLE: '桌位', COUNTER: '吧台', T: '桌位', C: '吧台' };
 
 function esc(s) { return s == null ? '' : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
@@ -18,6 +23,73 @@ function formatNtfyTopic(raw, maxLen = 64) {
   return topic;
 }
 function fallbackNtfyTopic() { return 'user-' + Math.random().toString(36).slice(2, 8); }
+function validGuestTopicBase(topic) {
+  return typeof topic === 'string' && /^[a-zA-Z0-9_-]{1,59}$/.test(topic);
+}
+function randomGuestTopicSuffix() {
+  const values = new Uint8Array(4);
+  crypto.getRandomValues(values);
+  return Array.from(values, value => GUEST_TOPIC_SUFFIX_CHARS[value % GUEST_TOPIC_SUFFIX_CHARS.length]).join('');
+}
+function getOrCreateGuestTopic(base, requestedSuffix = '') {
+  const savedBase = getSetting('guestTopicBase', '');
+  const savedSuffix = getSetting('guestTopicSuffix', '');
+  const suffix = /^[A-Z0-9]{4}$/.test(requestedSuffix)
+    ? requestedSuffix
+    : (base === savedBase && /^[A-Z0-9]{4}$/.test(savedSuffix) ? savedSuffix : randomGuestTopicSuffix());
+  setSetting('guestTopicBase', base);
+  setSetting('guestTopicSuffix', suffix);
+  return `${base}_${suffix}`;
+}
+function getGuestToken() {
+  const saved = localStorage.getItem(GUEST_TOKEN_KEY);
+  if (/^[A-Za-z0-9_-]{43}$/.test(saved || '')) return saved;
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  const token = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  localStorage.setItem(GUEST_TOKEN_KEY, token);
+  return token;
+}
+function getSavedGuestToken() {
+  const saved = localStorage.getItem(GUEST_TOKEN_KEY);
+  return /^[A-Za-z0-9_-]{43}$/.test(saved || '') ? saved : '';
+}
+function hasSavedGuestNotificationMode() {
+  const topic = getStoredValidNtfyTopic();
+  const token = getSavedGuestToken();
+  if (!topic || !token) return false;
+  if (getSetting('guestNotificationMode', false) === true) return true;
+
+  // Migrate devices that completed guest setup before this preference was introduced.
+  const base = getSetting('guestTopicBase', '');
+  const suffix = getSetting('guestTopicSuffix', '');
+  if (validGuestTopicBase(base) && /^[A-Z0-9]{4}$/.test(suffix) && topic === `${base}_${suffix}`) {
+    setSetting('guestNotificationMode', true);
+    return true;
+  }
+  return false;
+}
+function currentMonitorOwner() {
+  return state.sessionId ? { mode: 'account', sessionId: state.sessionId } : { mode: 'guest', token: getGuestToken() };
+}
+function monitorAuthHeaders(owner = currentMonitorOwner()) {
+  return owner.mode === 'guest' ? { Authorization: `Bearer ${owner.token}` } : {};
+}
+function monitorCollectionUrl(owner = currentMonitorOwner()) {
+  return owner.mode === 'account' ? `/api/monitors?sessionId=${encodeURIComponent(owner.sessionId)}` : '/api/monitors';
+}
+async function fetchOwnedMonitors() {
+  const owners = [currentMonitorOwner()];
+  const savedGuestToken = getSavedGuestToken();
+  if (state.sessionId && savedGuestToken) owners.push({ mode: 'guest', token: savedGuestToken });
+  const lists = await Promise.all(owners.map(async owner => {
+    const res = await fetch(monitorCollectionUrl(owner), { headers: monitorAuthHeaders(owner) });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data) ? data.map(monitor => ({ ...monitor, _ownerMode: owner.mode })) : [];
+  }));
+  return lists.flat();
+}
 function makeTopic(email) {
   const raw = (email || '').split('@')[0] || '';
   const suffix = '-sushiroad';
@@ -34,10 +106,52 @@ function clampInt(v, min, max, fallback) {
 function validTimeValue(v) {
   return typeof v === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
 }
+function validDateValue(v) {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const timestamp = Date.parse(`${v}T12:00:00+08:00`);
+  return Number.isFinite(timestamp) && new Date(timestamp + 8 * 3600000).toISOString().slice(0, 10) === v;
+}
+function taipeiDateValue(date = new Date()) {
+  return date.toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
+}
+function addDaysToDateValue(value, days) {
+  const timestamp = Date.parse(`${value}T12:00:00+08:00`) + days * 86400000;
+  return new Date(timestamp).toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
+}
+function defaultTargetDate() {
+  return taipeiDateValue(new Date(Date.now() + 30 * 60000));
+}
 function defaultTargetTime() {
-  const now = new Date();
-  now.setMinutes(now.getMinutes() + 30);
-  return now.toTimeString().slice(0, 5);
+  return new Date(Date.now() + 30 * 60000).toLocaleTimeString('en-GB', {
+    timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+function targetTimestamp(targetDate, targetTime) {
+  if (!validDateValue(targetDate) || !validTimeValue(targetTime)) return NaN;
+  return Date.parse(`${targetDate}T${targetTime}:00+08:00`);
+}
+function formatTargetDateTime(targetDate, targetTime) {
+  return `${targetDate} ${targetTime}`;
+}
+function formatTargetDateDisplay(value) {
+  if (!validDateValue(value)) return '選擇日期';
+  const [year, month, day] = value.split('-').map(Number);
+  return `${year}年${month}月${day}日`;
+}
+function formatTargetTimeDisplay(value) {
+  if (!validTimeValue(value)) return '選擇時間';
+  const [hour, minute] = value.split(':').map(Number);
+  const period = hour < 6 ? '凌晨' : hour < 12 ? '上午' : hour < 18 ? '下午' : '晚上';
+  return `${period}${hour % 12 || 12}:${String(minute).padStart(2, '0')}`;
+}
+function updateTargetPickerDisplays() {
+  $('#target-date-display').textContent = formatTargetDateDisplay($('#target-date').value);
+  $('#target-time-display').textContent = formatTargetTimeDisplay($('#target-time').value);
+}
+function setTargetDateBounds() {
+  const today = taipeiDateValue();
+  $('#target-date').min = today;
+  $('#target-date').max = addDaysToDateValue(today, 30);
 }
 
 const $ = s => document.querySelector(s);
@@ -85,7 +199,9 @@ function applyAccountSettings(settings) {
     }
 
     applyReservationPeople(settings.reservationAdult ?? 2, settings.reservationChild ?? 0);
-    $('#target-time').value = defaultTargetTime();
+    if (!validDateValue($('#target-date').value)) $('#target-date').value = defaultTargetDate();
+    if (!validTimeValue($('#target-time').value)) $('#target-time').value = defaultTargetTime();
+    updateTargetPickerDisplays();
     $('#setting-store-poll').value = settings.storePoll ?? 60;
     $('#setting-schedule-poll').value = settings.schedulePoll ?? 60;
     $('#setting-ntfy-topic').value = validNtfyTopic(settings.ntfyTopic) ? settings.ntfyTopic : getDefaultNtfyTopic();
@@ -182,6 +298,43 @@ function hideNtfyTopicError() {
   if (!el) return;
   el.textContent = '';
   el.style.display = 'none';
+}
+async function copyText(text, button) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      if (!document.execCommand('copy')) throw new Error('copy failed');
+      textarea.remove();
+    }
+    if (button) {
+      const original = button.textContent;
+      button.textContent = '已複製';
+      button.classList.add('copy-success');
+      setTimeout(() => { button.textContent = original; button.classList.remove('copy-success'); }, 1600);
+    }
+    return true;
+  } catch {
+    alert('無法自動複製，請長按 Topic 手動複製');
+    return false;
+  }
+}
+function copyTopicFromSettings(button) {
+  const topic = $('#setting-ntfy-topic').value.trim();
+  if (!validNtfyTopic(topic)) return showNtfyTopicError('請先輸入有效的 Topic');
+  copyText(topic, button);
+}
+function copyTopic(topic, button) {
+  if (validNtfyTopic(topic)) copyText(topic, button);
+}
+function copyConfirmedTopic(button) {
+  copyTopic($('#topic-confirmation-value').value.trim(), button);
 }
 function loadHistory() { try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; } catch { return []; } }
 function saveHistory(h) { localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); }
@@ -420,7 +573,7 @@ function selectStore(id) {
   if (!state.selectedStore) return;
   const s = state.selectedStore, open = s.storeStatus === 'OPEN';
   const dist = s._dist != null ? `<div class="store-distance">${fmtDist(s._dist)}</div>` : '';
-  $('#selected-store-info').innerHTML = `<div><div class="store-name">${esc(s.name)}</div><div class="store-address">${esc(s.address)}</div>${dist}</div>
+  $('#selected-store-info').innerHTML = `<div class="store-main"><div class="store-name">${esc(s.name)}</div><div class="store-address">${esc(s.address)}</div>${dist}</div>
     <div class="store-status"><span class="status-badge ${open?'open':'closed'}">${open?'營業中':'未營業'}</span></div>`;
   showStep('config');
 }
@@ -446,15 +599,31 @@ function bindEvents() {
   });
   $('#btn-back').addEventListener('click', () => showStep('store'));
   $('#btn-submit').addEventListener('click', handleSubmit);
-  $('#btn-new').addEventListener('click', () => showStep('store'));
+  $('#btn-new').addEventListener('click', () => {
+    state.pendingSubmit = null;
+    state.submitFlow = 'idle';
+    setSubmitBusy(false);
+    showStep('store');
+  });
   $$('.tab-btn').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
   $('#btn-clear-history').addEventListener('click', () => { if (confirm('清除所有紀錄？')) { saveHistory([]); renderHistory(); } });
   $('#setting-store-poll').addEventListener('change', e => { setSetting('storePoll', Number(e.target.value)); startStorePoll(); });
   $('#setting-schedule-poll').addEventListener('change', e => setSetting('schedulePoll', Number(e.target.value)));
   $('#target-time').addEventListener('focus', e => {
     if (!validTimeValue(e.target.value)) e.target.value = defaultTargetTime();
+    updateTargetPickerDisplays();
+  });
+  $('#target-date').addEventListener('focus', e => {
+    setTargetDateBounds();
+    if (!validDateValue(e.target.value)) e.target.value = defaultTargetDate();
+    updateTargetPickerDisplays();
+  });
+  ['input', 'change'].forEach(eventName => {
+    $('#target-date').addEventListener(eventName, updateTargetPickerDisplays);
+    $('#target-time').addEventListener(eventName, updateTargetPickerDisplays);
   });
   $('#setting-ntfy-topic').addEventListener('input', () => hideNtfyTopicError());
+  $('#guest-ntfy-topic').addEventListener('input', updateGuestTopicSuffixPreview);
   $('#setting-ntfy-topic').addEventListener('blur', e => {
     const raw = e.target.value.trim();
     if (validNtfyTopic(raw)) {
@@ -476,14 +645,19 @@ function bindEvents() {
 
 function initSettings() {
   applyReservationPeople(getSetting('reservationAdult', 2), getSetting('reservationChild', 0));
+  setTargetDateBounds();
+  $('#target-date').value = defaultTargetDate();
   $('#target-time').value = defaultTargetTime();
+  updateTargetPickerDisplays();
   $('#setting-store-poll').value = getSetting('storePoll', 60);
   $('#setting-schedule-poll').value = getSetting('schedulePoll', 60);
   const storedTopic = getSetting('ntfyTopic', '');
   const normalizedTopic = formatNtfyTopic(storedTopic);
-  const effectiveTopic = validNtfyTopic(normalizedTopic) ? normalizedTopic : getDefaultNtfyTopic();
+  const effectiveTopic = validNtfyTopic(storedTopic)
+    ? storedTopic
+    : (validNtfyTopic(normalizedTopic) ? normalizedTopic : getDefaultNtfyTopic());
   $('#setting-ntfy-topic').value = effectiveTopic;
-  if (validNtfyTopic(storedTopic)) {
+  if (!validNtfyTopic(storedTopic)) {
     setSetting('ntfyTopic', effectiveTopic);
   }
   hideNtfyTopicError();
@@ -494,44 +668,195 @@ function initSettings() {
 
 // ==================== Submit ====================
 async function handleSubmit() {
-  if (!state.selectedStore) return;
+  if (!state.authReady || !state.selectedStore || state.submitFlow !== 'idle') return;
+  const targetDate = $('#target-date').value;
+  const targetTime = $('#target-time').value;
+  if (!validDateValue(targetDate)) return alert('請選擇有效的用餐日期');
+  if (!validTimeValue(targetTime)) return alert('請選擇用餐時間');
+  const targetAt = targetTimestamp(targetDate, targetTime);
+  if (targetAt <= Date.now()) return alert('選擇的用餐日期時間已經過了，請重新選擇');
+  if (targetDate > addDaysToDateValue(taipeiDateValue(), 30)) return alert('用餐日期最多可選擇未來 30 天內');
+  saveReservationPeople();
+  state.pendingSubmit = {
+    store: { ...state.selectedStore },
+    adult: state.adult,
+    child: state.child,
+    targetDate,
+    targetTime,
+  };
+
   if (!state.sessionId) {
-    $('#ticket-status').innerHTML = `<div class="status-icon">🔒</div><div class="status-text">請先登入</div><div class="status-subtext">到設定頁面登入壽司郎帳號</div>`;
-    $('#btn-cancel-ticket').style.display = 'none';
-    $('#schedule-logs').style.display = 'none';
-    showStep('status');
+    if (hasSavedGuestNotificationMode()) {
+      state.pendingSubmit.guestToken = getSavedGuestToken();
+      await resumePendingSubmit('guest');
+      return;
+    }
+    state.submitFlow = 'account-choice';
+    $('#account-choice-overlay').style.display = 'flex';
     return;
   }
+  await resumePendingSubmit('account');
+}
 
-  const targetTime = $('#target-time').value;
-  if (!targetTime) return alert('請選擇用餐時間');
-  saveReservationPeople();
+function setSubmitBusy(busy) {
+  $('#btn-submit').disabled = busy;
+  $('#btn-submit').textContent = busy ? '處理中...' : '預約 / 監控';
+}
 
-  $('#btn-submit').disabled = true;
-  $('#btn-submit').textContent = '處理中...';
+function restorePendingSubmit(action) {
+  state.selectedStore = { ...action.store };
+  applyReservationPeople(action.adult, action.child);
+  $('#target-date').value = action.targetDate;
+  $('#target-time').value = action.targetTime;
+  updateTargetPickerDisplays();
+}
+
+async function resumePendingSubmit(mode) {
+  const action = state.pendingSubmit;
+  if (!action || state.submitFlow === 'running') return;
+  state.submitFlow = 'running';
+  restorePendingSubmit(action);
+  if (mode === 'account') {
+    action.accountOwner = { mode: 'account', sessionId: state.sessionId };
+    saveReservationPeople();
+  }
+  $('#account-choice-overlay').style.display = 'none';
+  $('#guest-topic-overlay').style.display = 'none';
+  setSubmitBusy(true);
 
   try {
-    await tryBookOrMonitor(targetTime);
+    const result = mode === 'guest'
+      ? await startMonitoring(action.targetDate, action.targetTime, { mode: 'guest', token: action.guestToken })
+      : await tryBookOrMonitor(action.targetDate, action.targetTime, action.accountOwner.sessionId);
+    if (result === 'slot-choice') {
+      state.submitFlow = 'slot-choice';
+      setSubmitBusy(false);
+      return;
+    }
   } catch (err) {
     alert('操作失敗: ' + err.message);
   } finally {
-    $('#btn-submit').disabled = false;
-    $('#btn-submit').textContent = '預約 / 監控';
+    if (state.submitFlow === 'slot-choice') return;
+    state.pendingSubmit = null;
+    state.submitFlow = 'idle';
+    state.loginContext = 'settings';
+    setSubmitBusy(false);
   }
 }
 
-async function tryBookOrMonitor(targetTime) {
+function chooseAccountLogin() {
+  $('#account-choice-overlay').style.display = 'none';
+  state.submitFlow = 'login';
+  showLoginDialog('submit');
+}
+
+function chooseGuestMonitoring() {
+  $('#account-choice-overlay').style.display = 'none';
+  state.submitFlow = 'guest-topic';
+  const input = $('#guest-ntfy-topic');
+  const savedBase = getSetting('guestTopicBase', '');
+  input.value = state.guestTopicDraftBase !== null
+    ? state.guestTopicDraftBase
+    : (validGuestTopicBase(savedBase) ? savedBase : '');
+  if (!/^[A-Z0-9]{4}$/.test(state.guestTopicNewSuffix)) state.guestTopicNewSuffix = randomGuestTopicSuffix();
+  updateGuestTopicSuffixPreview();
+  $('#guest-topic-error').style.display = 'none';
+  $('#guest-topic-overlay').style.display = 'flex';
+  input.focus();
+}
+
+function getGuestTopicDraftSuffix() {
+  const base = $('#guest-ntfy-topic').value.trim();
+  const savedBase = getSetting('guestTopicBase', '');
+  const savedSuffix = getSetting('guestTopicSuffix', '');
+  if (base === savedBase && /^[A-Z0-9]{4}$/.test(savedSuffix)) return savedSuffix;
+  if (!/^[A-Z0-9]{4}$/.test(state.guestTopicNewSuffix)) state.guestTopicNewSuffix = randomGuestTopicSuffix();
+  return state.guestTopicNewSuffix;
+}
+
+function updateGuestTopicSuffixPreview() {
+  state.guestTopicDraftBase = $('#guest-ntfy-topic').value;
+  const suffix = getGuestTopicDraftSuffix();
+  $('#guest-topic-suffix').textContent = `_${suffix}`;
+}
+
+function backToAccountChoice() {
+  $('#guest-topic-overlay').style.display = 'none';
+  if (!state.pendingSubmit) return;
+  state.submitFlow = 'account-choice';
+  $('#account-choice-overlay').style.display = 'flex';
+}
+
+function cancelAccountChoice() {
+  $('#account-choice-overlay').style.display = 'none';
+  $('#guest-topic-overlay').style.display = 'none';
+  state.pendingSubmit = null;
+  state.submitFlow = 'idle';
+  state.guestTopicDraftBase = null;
+  state.guestTopicNewSuffix = '';
+  setSubmitBusy(false);
+}
+
+async function confirmGuestMonitoring() {
+  if (state.submitFlow !== 'guest-topic') return;
+  const input = $('#guest-ntfy-topic');
+  const topicBase = input.value.trim();
+  if (!validGuestTopicBase(topicBase)) {
+    $('#guest-topic-error').textContent = 'Topic 名稱僅允許英文字母、數字、底線與連字號，長度最多 59 個字元。';
+    $('#guest-topic-error').style.display = 'block';
+    return;
+  }
+  const topic = getOrCreateGuestTopic(topicBase, getGuestTopicDraftSuffix());
+  setSetting('ntfyTopic', topic);
+  setSetting('ntfyTopicAuto', false);
+  setSetting('guestNotificationMode', true);
+  $('#setting-ntfy-topic').value = topic;
+  state.pendingSubmit.guestToken = getGuestToken();
+  state.guestTopicDraftBase = null;
+  state.guestTopicNewSuffix = '';
+  showTopicConfirmation(topic, 'guest');
+}
+
+function showTopicConfirmation(topic, continuation = null) {
+  if (!validNtfyTopic(topic)) return;
+  state.topicConfirmation = { topic, continuation };
+  if (continuation) state.submitFlow = 'topic-confirmation';
+  $('#topic-confirmation-value').value = topic;
+  $('#topic-confirmation-copy').textContent = '複製';
+  $('#topic-confirmation-copy').classList.remove('copy-success');
+  $('#topic-confirmation-overlay').style.display = 'flex';
+}
+
+async function confirmTopicConfirmation() {
+  const confirmation = state.topicConfirmation;
+  if (!confirmation) return;
+  const button = $('#btn-topic-confirmation-ok');
+  button.disabled = true;
+  $('#topic-confirmation-overlay').style.display = 'none';
+  state.topicConfirmation = null;
+  try {
+    if (confirmation.continuation && state.pendingSubmit) {
+      await resumePendingSubmit(confirmation.continuation);
+    } else if (confirmation.continuation) {
+      state.submitFlow = 'idle';
+      setSubmitBusy(false);
+    }
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function tryBookOrMonitor(targetDate, targetTime, accountSessionId = state.sessionId) {
   const storeid = state.selectedStore.id;
   const totalPersons = state.adult + state.child;
   const targetMins = parseInt(targetTime.split(':')[0]) * 60 + parseInt(targetTime.split(':')[1]);
 
-  // Get today's date in yyyyMMdd
-  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' }).replace(/-/g, '');
+  const selectedDate = targetDate.replace(/-/g, '');
 
   // Fetch available slots
   const res = await fetch(`/api/stores/${storeid}/timeslots?numpersons=${totalPersons}&tabletype=T`);
   const slots = await res.json();
-  const available = Array.isArray(slots) ? slots.filter(s => s.availability === 'AVAILABLE' && s.date === today) : [];
+  const available = Array.isArray(slots) ? slots.filter(s => s.availability === 'AVAILABLE' && s.date === selectedDate) : [];
 
   // Find slots within ±15 minutes of target
   const nearby = [];
@@ -546,26 +871,27 @@ async function tryBookOrMonitor(targetTime) {
 
   if (nearby.length === 0) {
     // No slots → start monitoring
-    await startMonitoring(targetTime);
+    await startMonitoring(targetDate, targetTime, { mode: 'account', sessionId: accountSessionId });
     return;
   }
 
   // Check if exact match exists (diff === 0)
   const exact = nearby.find(s => s.diff === 0);
   if (exact) {
-    await confirmAndReserve(exact);
+    await confirmAndReserve(exact, accountSessionId);
     return;
   }
 
   // Multiple nearby slots → ask user to pick
-  showSlotPicker(nearby, targetTime);
+  showSlotPicker(nearby, targetDate, targetTime);
+  return 'slot-choice';
 }
 
-function showSlotPicker(slots, targetTime) {
+function showSlotPicker(slots, targetDate, targetTime) {
   let html = `
     <div class="status-icon">📅</div>
     <div class="status-text">選擇預約時段</div>
-    <div class="status-subtext">指定時間 ${esc(targetTime)} 無可用時段，以下為 ±15 分鐘內可選時段：</div>
+    <div class="status-subtext">指定時間 ${esc(formatTargetDateTime(targetDate, targetTime))} 無可用時段，以下為 ±15 分鐘內可選時段：</div>
     <div style="margin-top:12px">`;
   for (const s of slots) {
     const diffLabel = s.diff > 0 ? `晚 ${s.diff} 分鐘` : `早 ${Math.abs(s.diff)} 分鐘`;
@@ -573,7 +899,7 @@ function showSlotPicker(slots, targetTime) {
   }
   html += `</div>
     <div style="margin-top:12px">
-      <button class="btn btn-secondary btn-sm" onclick="startMonitoringFromUI('${escJs(targetTime)}')">改用監控模式</button>
+      <button class="btn btn-secondary btn-sm" onclick="startMonitoringFromUI()">改用監控模式</button>
     </div>`;
   $('#ticket-status').innerHTML = html;
   $('#btn-cancel-ticket').style.display = 'none';
@@ -582,14 +908,47 @@ function showSlotPicker(slots, targetTime) {
 }
 
 async function pickSlot(date, start, end) {
-  await confirmAndReserve({ date, start, end, timeLabel: start.substring(0,2)+':'+start.substring(2,4) });
+  if (state.submitFlow !== 'slot-choice') return;
+  state.submitFlow = 'running';
+  $$('#ticket-status button').forEach(button => { button.disabled = true; });
+  try {
+    await confirmAndReserve(
+      { date, start, end, timeLabel: start.substring(0,2)+':'+start.substring(2,4) },
+      state.pendingSubmit?.accountOwner?.sessionId,
+    );
+  } catch (err) {
+    $('#ticket-status').innerHTML = `<div class="status-icon">❌</div><div class="status-text">預約失敗</div><div class="status-subtext">${esc(err.message || '請稍後再試')}</div>`;
+  } finally {
+    state.pendingSubmit = null;
+    state.submitFlow = 'idle';
+  }
 }
 
-async function startMonitoringFromUI(targetTime) {
-  await startMonitoring(targetTime);
+async function startMonitoringFromUI() {
+  if (state.submitFlow !== 'slot-choice') return;
+  state.submitFlow = 'running';
+  $$('#ticket-status button').forEach(button => { button.disabled = true; });
+  try {
+    const started = await startMonitoring(
+      state.pendingSubmit?.targetDate,
+      state.pendingSubmit?.targetTime,
+      state.pendingSubmit?.accountOwner,
+    );
+    if (!started) {
+      state.submitFlow = 'slot-choice';
+      $$('#ticket-status button').forEach(button => { button.disabled = false; });
+      return;
+    }
+    state.pendingSubmit = null;
+    state.submitFlow = 'idle';
+  } catch (err) {
+    alert('建立監控失敗: ' + err.message);
+    state.submitFlow = 'slot-choice';
+    $$('#ticket-status button').forEach(button => { button.disabled = false; });
+  }
 }
 
-async function confirmAndReserve(slot) {
+async function confirmAndReserve(slot, accountSessionId = state.sessionId) {
   $('#ticket-status').innerHTML = '<div class="loading"><div class="spinner"></div><p>預約中...</p></div>';
   showStep('status');
 
@@ -597,7 +956,7 @@ async function confirmAndReserve(slot) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      sessionId: state.sessionId,
+      sessionId: accountSessionId,
       storeid: state.selectedStore.id,
       adult: state.adult, child: state.child, tabletype: 'T',
       date: slot.date, time: slot.start, end: slot.end,
@@ -646,46 +1005,49 @@ async function confirmAndReserve(slot) {
   $('#schedule-logs').style.display = 'none';
 }
 
-async function startMonitoring(targetTime) {
+async function startMonitoring(targetDate, targetTime, owner = currentMonitorOwner()) {
   const ntfyTopic = getSetting('ntfyTopic', '');
   if (!ntfyTopic) {
     alert('請先在設定頁面填寫 ntfy Topic');
-    return;
+    return false;
   }
 
   const res = await fetch('/api/monitor', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...monitorAuthHeaders(owner) },
     body: JSON.stringify({
       storeid: state.selectedStore.id,
       storeName: state.selectedStore.name,
       adult: state.adult, child: state.child,
-      targetTime, ntfyTopic,
+      targetDate, targetTime, ntfyTopic,
       pollInterval: getSetting('schedulePoll', 60),
       earlyWindow: Math.max(0, Math.min(30, Number(getSetting('earlyWindow', 10)) || 10)),
       lateWindow: Math.max(0, Math.min(30, Number(getSetting('lateWindow', 5)) || 5)),
-      sessionId: state.sessionId,
+      ...(owner.mode === 'account' ? { sessionId: owner.sessionId } : {}),
     }),
   });
   const data = await res.json();
   if (!res.ok) {
     alert(data.error || '建立監控失敗');
-    return;
+    return false;
   }
 
+  const finalTopic = data.ntfyTopic || ntfyTopic;
   $('#ticket-status').innerHTML = `
     <div class="status-icon">📡</div>
     <div class="status-text">監控已啟動</div>
-    <div class="status-subtext">${esc(state.selectedStore.name)} | 目標: ${esc(targetTime)}</div>
+    <div class="status-subtext">${esc(state.selectedStore.name)} | 目標: ${esc(formatTargetDateTime(targetDate, targetTime))}</div>
     <div class="status-subtext">無可用預約時段，系統將監控等候時間</div>
     <div class="status-subtext">當最佳抽號時機到來時，會透過 ntfy 通知您</div>
-    <div class="status-subtext">通知 Topic：ntfy.sh/${esc(data.ntfyTopic || ntfyTopic)}</div>
+    <div class="status-subtext">通知 Topic：ntfy.sh/${esc(finalTopic)}</div>
     ${data.startNotificationSent ? '<div class="status-subtext">已發送監控啟動通知</div>' : '<div class="status-subtext warning-text">監控已啟動，但啟動通知暫時無法送達</div>'}
     <div class="status-subtext pulse" style="margin-top:8px">監控 ID: ${esc(data.monitorId)}</div>`;
   $('#btn-cancel-ticket').style.display = 'inline-block';
   $('#btn-cancel-ticket').textContent = '取消監控';
   $('#btn-cancel-ticket').onclick = async () => {
-    await fetch(`/api/monitor/${data.monitorId}?sessionId=${state.sessionId}`, { method: 'DELETE' });
+    const url = owner.mode === 'account' ? `/api/monitor/${data.monitorId}?sessionId=${encodeURIComponent(owner.sessionId)}` : `/api/monitor/${data.monitorId}`;
+    const cancelled = await fetch(url, { method: 'DELETE', headers: monitorAuthHeaders(owner) });
+    if (!cancelled.ok) return alert('取消監控失敗，請稍後再試');
     $('#ticket-status').innerHTML = '<div class="status-icon">✅</div><div class="status-text">已取消監控</div>';
     $('#btn-cancel-ticket').style.display = 'none';
     updateMonitorBadge();
@@ -693,6 +1055,7 @@ async function startMonitoring(targetTime) {
   $('#schedule-logs').style.display = 'none';
   showStep('status');
   updateMonitorBadge();
+  return true;
 }
 
 // ==================== History ====================
@@ -769,8 +1132,7 @@ async function cancelReservation(ticketId, storeid) {
 // ==================== Monitor Page ====================
 async function renderMonitor() {
   try {
-    const res = await fetch('/api/monitors?sessionId=' + (state.sessionId || ''));
-    const monitors = await res.json();
+    const monitors = await fetchOwnedMonitors();
     if (!monitors.length) { $('#monitor-list').innerHTML = '<div class="empty-state">目前沒有進行中的監控</div>'; return; }
     let html = '';
     for (const m of monitors) {
@@ -779,29 +1141,34 @@ async function renderMonitor() {
       html += `<div class="monitor-card">
         <div class="m-header"><span class="m-store">${esc(m.storeName)}</span><span>${icons[m.status]||''} ${texts[m.status]||m.status}</span></div>
         <div class="m-grid">
-          <div class="m-stat"><div class="m-stat-value">${esc(m.targetTime)}</div><div class="m-stat-label">目標時間</div></div>
+          <div class="m-stat"><div class="m-stat-value">${esc(m.targetDate ? `${m.targetDate.slice(5)} ${m.targetTime}` : m.targetTime)}</div><div class="m-stat-label">目標日期時間</div></div>
           <div class="m-stat"><div class="m-stat-value">${m.lastWait != null ? m.lastWait+'分' : '--'}</div><div class="m-stat-label">目前等候</div></div>
         </div>
         <div class="m-topic"><span>通知 Topic</span><span class="m-topic-value">ntfy.sh/${esc(m.ntfyTopic || '未提供')}</span></div>
         ${m.logs && m.logs.length ? `<div class="logs" style="margin-top:10px;max-height:100px">${m.logs.slice(-3).map(l=>`<div class="log-entry">${esc(l)}</div>`).join('')}</div>` : ''}
         <div class="m-updated">${new Date().toLocaleTimeString('zh-TW')} 更新</div>
-        <div class="m-actions"><button class="btn btn-danger btn-sm" onclick="cancelMonitor('${escJs(m.monitorId)}')">${m.status === 'monitoring' || m.status === 'waiting' ? '取消監控' : '刪除'}</button></div>
+        <div class="m-actions"><button class="btn btn-danger btn-sm" onclick="cancelMonitor('${escJs(m.monitorId)}','${escJs(m._ownerMode)}')">${m.status === 'monitoring' || m.status === 'waiting' ? '取消監控' : '刪除'}</button></div>
       </div>`;
     }
     $('#monitor-list').innerHTML = html;
   } catch { $('#monitor-list').innerHTML = '<div class="empty-state">載入失敗</div>'; }
 }
 
-async function cancelMonitor(id) {
-  await fetch(`/api/monitor/${id}?sessionId=${state.sessionId || ''}`, { method: 'DELETE' });
+async function cancelMonitor(id, ownerMode = state.sessionId ? 'account' : 'guest') {
+  const owner = ownerMode === 'account'
+    ? { mode: 'account', sessionId: state.sessionId }
+    : { mode: 'guest', token: getSavedGuestToken() };
+  if (!owner.sessionId && !owner.token) return alert('找不到此監控的裝置權限');
+  const url = owner.mode === 'account' ? `/api/monitor/${id}?sessionId=${encodeURIComponent(owner.sessionId)}` : `/api/monitor/${id}`;
+  const res = await fetch(url, { method: 'DELETE', headers: monitorAuthHeaders(owner) });
+  if (!res.ok) return alert('取消監控失敗，請稍後再試');
   renderMonitor();
   updateMonitorBadge();
 }
 
 async function updateMonitorBadge() {
   try {
-    const res = await fetch('/api/monitors?sessionId=' + (state.sessionId || ''));
-    const monitors = await res.json();
+    const monitors = await fetchOwnedMonitors();
     const active = monitors.filter(m => m.status === 'monitoring' || m.status === 'waiting').length;
     $('#monitor-badge').style.display = active > 0 ? 'block' : 'none';
     $('#monitor-badge').textContent = active;
@@ -828,8 +1195,15 @@ function requestLocation() {
 }
 
 // ==================== Login ====================
-function showLoginDialog() { $('#login-overlay').style.display = 'flex'; $('#login-error').style.display = 'none'; $('#login-email').value = getSavedAccountEmail(); $('#login-password').value = ''; }
-function hideLoginDialog() { $('#login-overlay').style.display = 'none'; }
+function showLoginDialog(context = 'settings') { state.loginContext = context; $('#login-overlay').style.display = 'flex'; $('#login-error').style.display = 'none'; $('#login-email').value = getSavedAccountEmail(); $('#login-password').value = ''; }
+function hideLoginDialog() {
+  $('#login-overlay').style.display = 'none';
+  if (state.loginContext === 'submit' && state.pendingSubmit) {
+    state.submitFlow = 'account-choice';
+    $('#account-choice-overlay').style.display = 'flex';
+  }
+  state.loginContext = 'settings';
+}
 
 async function doLogin() {
   const email = $('#login-email').value.trim(), password = $('#login-password').value;
@@ -839,14 +1213,18 @@ async function doLogin() {
     const res = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) });
     const data = await res.json();
     if (data.success) {
+      const resumeSubmit = state.loginContext === 'submit' && !!state.pendingSubmit;
       state.sessionId = data.sessionId;
       localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId: data.sessionId, email: data.email }));
       saveAccountEmail(data.email);
       await syncAccountSettings(data.settings, data.settingsExists);
-      updateLoginUI(data.email); hideLoginDialog();
+      updateLoginUI(data.email);
+      $('#login-overlay').style.display = 'none';
+      state.loginContext = 'settings';
       updateMonitorBadge();
       if (state.activeTab === 'history') renderHistory();
       if (state.activeTab === 'monitor') renderMonitor();
+      showTopicConfirmation(getEffectiveNtfyTopic(), resumeSubmit ? 'account' : null);
     } else {
       
       $('#login-error').textContent = !res.ok ? '帳號或密碼錯誤' : (data.error || '登入失敗');
@@ -908,6 +1286,15 @@ window.selectStore = selectStore;
 window.showLoginDialog = showLoginDialog;
 window.hideLoginDialog = hideLoginDialog;
 window.doLogin = doLogin;
+window.chooseAccountLogin = chooseAccountLogin;
+window.chooseGuestMonitoring = chooseGuestMonitoring;
+window.confirmGuestMonitoring = confirmGuestMonitoring;
+window.copyTopicFromSettings = copyTopicFromSettings;
+window.copyTopic = copyTopic;
+window.copyConfirmedTopic = copyConfirmedTopic;
+window.confirmTopicConfirmation = confirmTopicConfirmation;
+window.backToAccountChoice = backToAccountChoice;
+window.cancelAccountChoice = cancelAccountChoice;
 window.logout = logout;
 window.requestLocation = requestLocation;
 window.cancelMonitor = cancelMonitor;
@@ -935,7 +1322,10 @@ if (Number.isFinite(savedLat) && Number.isFinite(savedLon) && savedLat >= -90 &&
 
 async function boot() {
   await init();
+  setSubmitBusy(true);
   await restoreSession();
+  state.authReady = true;
+  setSubmitBusy(false);
   updateMonitorBadge();
 }
 

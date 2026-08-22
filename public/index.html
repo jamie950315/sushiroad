@@ -50,9 +50,23 @@
             </div>
           </div>
 
+          <div class="form-row target-datetime-row">
+            <div class="form-group">
+              <label for="target-date">預計用餐日期</label>
+              <label class="picker-control" for="target-date">
+                <span id="target-date-display" class="picker-value">選擇日期</span>
+                <input type="date" id="target-date" aria-label="預計用餐日期">
+              </label>
+            </div>
+            <div class="form-group">
+              <label for="target-time">預計用餐時間</label>
+              <label class="picker-control" for="target-time">
+                <span id="target-time-display" class="picker-value">選擇時間</span>
+                <input type="time" id="target-time" value="12:00" aria-label="預計用餐時間">
+              </label>
+            </div>
+          </div>
           <div class="form-group">
-            <label>預計用餐時間</label>
-            <input type="time" id="target-time" value="12:00">
             <p class="hint">系統會先嘗試預約該時段。若無可用時段，將監控等候時間並在最佳時機通知您去 APP 抽號。</p>
           </div>
 
@@ -113,7 +127,10 @@
               <div class="setting-desc">當監控偵測到最佳抽號時機，透過 ntfy.sh 推播通知</div>
             </div>
             <div class="setting-control">
-              <input type="text" id="setting-ntfy-topic" placeholder="sushiroad-notify" class="overlay-input" style="width:140px;font-size:13px;padding:8px">
+              <div class="topic-copy-control">
+                <input type="text" id="setting-ntfy-topic" placeholder="sushiroad-notify" class="overlay-input">
+                <button class="btn btn-secondary btn-sm" type="button" onclick="copyTopicFromSettings(this)">複製</button>
+              </div>
               <div id="ntfy-topic-error" class="error-msg" style="display:none;margin-top:8px;font-size:12px"></div>
             </div>
           </div>
@@ -221,6 +238,58 @@
         <span class="tab-label">設定</span>
       </button>
     </nav>
+
+    <div id="account-choice-overlay" class="overlay" style="display:none">
+      <div class="overlay-backdrop" onclick="cancelAccountChoice()"></div>
+      <div class="overlay-panel">
+        <h2>要登入壽司郎帳號嗎？</h2>
+        <p class="hint">登入後，SushiRoad 可以提供完整功能：</p>
+        <ul class="benefit-list">
+          <li>發現可預約時段時自動預約</li>
+          <li>跨裝置登入及管理監測項目</li>
+          <li>保存偏好餐廳與用餐人數</li>
+        </ul>
+        <p class="hint">不登入也可以繼續使用通知功能，但不會自動預約。</p>
+        <div class="modal-actions-stacked">
+          <button class="btn btn-primary" onclick="chooseAccountLogin()">登入帳號</button>
+          <button class="btn btn-secondary" onclick="chooseGuestMonitoring()">不要登入，只使用通知</button>
+          <button class="btn btn-text" onclick="cancelAccountChoice()">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="guest-topic-overlay" class="overlay" style="display:none">
+      <div class="overlay-backdrop" onclick="backToAccountChoice()"></div>
+      <div class="overlay-panel">
+        <h2>設定通知 Topic</h2>
+        <p class="hint" style="margin-bottom:16px">請輸入自己的 ntfy.sh Topic 名稱。系統會在後面加上四位大寫英數碼，完整 Topic 會保存在這台裝置。這個模式只會發送通知，不會自動預約。</p>
+        <div class="form-group">
+          <label for="guest-ntfy-topic">ntfy.sh Topic</label>
+          <div class="guest-topic-compose">
+            <input type="text" id="guest-ntfy-topic" placeholder="my-sushiro-alert" class="overlay-input" autocomplete="off" maxlength="59">
+            <span id="guest-topic-suffix" class="guest-topic-suffix">_AB12</span>
+          </div>
+        </div>
+        <div id="guest-topic-error" class="error-msg" style="display:none"></div>
+        <div class="action-buttons">
+          <button class="btn btn-secondary" onclick="backToAccountChoice()">返回</button>
+          <button class="btn btn-primary" id="btn-confirm-guest" onclick="confirmGuestMonitoring()">確認 Topic</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="topic-confirmation-overlay" class="overlay" style="display:none">
+      <div class="overlay-backdrop"></div>
+      <div class="overlay-panel topic-confirmation-panel">
+        <h2>您的通知 Topic</h2>
+        <p class="hint">請在 ntfy.sh 訂閱以下完整 Topic：</p>
+        <input id="topic-confirmation-value" class="topic-confirmation-value" type="text" readonly aria-label="完整 Topic">
+        <div class="action-buttons">
+          <button class="btn btn-secondary" id="topic-confirmation-copy" onclick="copyConfirmedTopic(this)">複製</button>
+          <button class="btn btn-primary" id="btn-topic-confirmation-ok" onclick="confirmTopicConfirmation()">OK</button>
+        </div>
+      </div>
+    </div>
 
     <div id="login-overlay" class="overlay" style="display:none">
       <div class="overlay-backdrop" onclick="hideLoginDialog()"></div>
