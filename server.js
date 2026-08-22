@@ -19,6 +19,8 @@ const MAX_MONITOR_LOGS = 100;
 const MONITOR_STORE_CACHE_MS = 30000;
 const DB_PATH = process.env.SUSHIROAD_DB || path.join(__dirname, 'data', 'sushiroad.db.json');
 
+// cloudflared connects locally; trust forwarded client IPs only from loopback.
+app.set('trust proxy', 'loopback');
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public'), {
   etag: false,
@@ -31,6 +33,7 @@ app.use(express.static(path.join(__dirname, 'public'), {
 
 // --- Simple per-IP rate limiter ---
 const loginAttempts = new Map();
+const guestMonitorAttempts = new Map();
 function checkLoginRate(ip) {
   const now = Date.now();
   const entry = loginAttempts.get(ip) || { count: 0, resetAt: now + 60000 };
@@ -38,6 +41,15 @@ function checkLoginRate(ip) {
   entry.count++;
   loginAttempts.set(ip, entry);
   return entry.count <= 5; // 5 attempts per minute
+}
+
+function checkGuestMonitorRate(ip) {
+  const now = Date.now();
+  const entry = guestMonitorAttempts.get(ip) || { count: 0, resetAt: now + 60000 };
+  if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + 60000; }
+  entry.count++;
+  guestMonitorAttempts.set(ip, entry);
+  return entry.count <= 10;
 }
 
 // --- In-memory state ---
@@ -191,9 +203,17 @@ function accountKey(email) {
   return String(email || '').trim().toLowerCase();
 }
 
+function guestOwnerId(token) {
+  return crypto.createHash('sha256').update('guest-monitor:v1\0').update(token).digest('hex');
+}
+
 function persistMonitor(m) {
-  const { intervalId, isRunning, ...record } = m;
-  db.monitors[m.monitorId] = record;
+  const fields = [
+    'monitorId', 'storeid', 'storeName', 'adult', 'child', 'targetDate', 'targetTime', 'ntfyTopic',
+    'ownerType', 'ownerId', 'earlyWindow', 'lateWindow', 'pollInterval', 'targetAt',
+    'status', 'lastWait', 'createdAt', 'logs',
+  ];
+  db.monitors[m.monitorId] = Object.fromEntries(fields.map(field => [field, m[field]]));
   saveDb();
 }
 
@@ -402,6 +422,25 @@ function getSessionAuth(sessionId) {
   return { ...auth, accountKey: accountKey(auth.session.email) };
 }
 
+function getMonitorOwner(req, sessionId) {
+  const authorization = req.get('authorization') || '';
+  const hasBearer = authorization.startsWith('Bearer ');
+  if (sessionId && hasBearer) return { error: 400, message: 'choose either account session or guest token' };
+  if (sessionId) {
+    const auth = getSessionAuth(sessionId);
+    if (!auth) return { error: 401, message: 'session expired' };
+    return { ownerType: 'account', ownerId: auth.accountKey, auth };
+  }
+  if (!hasBearer) return { error: 401, message: 'monitor credentials required' };
+  const token = authorization.slice(7);
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return { error: 401, message: 'invalid guest token' };
+  return { ownerType: 'guest', ownerId: guestOwnerId(token) };
+}
+
+function monitorBelongsTo(monitor, owner) {
+  return monitor.ownerType === owner.ownerType && monitor.ownerId === owner.ownerId;
+}
+
 // --- Auth Routes ---
 
 app.post('/api/auth/login', async (req, res) => {
@@ -589,7 +628,9 @@ app.post('/api/reservation', async (req, res) => {
     if (result.data?.code === 'E010') {
       const check = await sushiroFetch(`/remote_auth/opentickets?region=${REGION}`, { headers: auth.headers });
       const created = (check.data?.RESERVATIONS || []).find(r =>
-        r.TICKET_DETAIL?.storeId === String(sid) && r.TICKET_DETAIL?.start === time
+        r.TICKET_DETAIL?.storeId === String(sid) &&
+        r.TICKET_DETAIL?.queueDate === date &&
+        r.TICKET_DETAIL?.start === time
       );
       if (created) {
         const reservation = {
@@ -741,49 +782,64 @@ app.post('/api/ticket/cancel', async (req, res) => {
 
 app.post('/api/monitor', async (req, res) => {
   try {
-    const { storeid, storeName, adult = 2, child = 0, targetTime, ntfyTopic, pollInterval = 60, earlyWindow = 10, lateWindow = 5, sessionId } = req.body;
-    if (!sessionId) return res.status(401).json({ error: 'login required' });
-    const auth = getSessionAuth(sessionId);
-    if (!auth) return res.status(401).json({ error: 'session expired' });
+    const { storeid, storeName, adult = 2, child = 0, targetDate, targetTime, ntfyTopic, pollInterval = 60, earlyWindow = 10, lateWindow = 5, sessionId } = req.body;
+    const owner = getMonitorOwner(req, sessionId);
+    if (owner.error) return res.status(owner.error).json({ error: owner.message });
+    if (owner.ownerType === 'guest' && !checkGuestMonitorRate(req.ip)) {
+      return res.status(429).json({ error: '建立監控過於頻繁，請稍後再試' });
+    }
 
     const sid = validInt(storeid);
-    if (sid === null || !targetTime) return res.status(400).json({ error: 'storeid and targetTime required' });
+    const adultCount = validInt(adult);
+    const childCount = validInt(child);
+    const targetAt = targetTimestamp(targetDate, targetTime);
+    if (sid === null || targetAt === null) return res.status(400).json({ error: '請選擇有效的用餐日期與時間' });
+    const now = Date.now();
+    if (targetAt <= now) return res.status(400).json({ error: '選擇的用餐日期時間已經過了，請重新選擇' });
+    const maxTargetDate = taipeiDateFromTimestamp(now + 30 * 86400000);
+    if (targetDate > maxTargetDate) return res.status(400).json({ error: '用餐日期最多可選擇未來 30 天內' });
+    if (adultCount === null || adultCount < 1 || adultCount > 18 || childCount === null || childCount < 0 || childCount > 17) {
+      return res.status(400).json({ error: 'invalid party size' });
+    }
+    if (typeof storeName !== 'string' || storeName.length > 100) return res.status(400).json({ error: 'invalid storeName' });
     if (!validNtfyTopic(ntfyTopic)) return res.status(400).json({ error: 'invalid ntfyTopic (letters, numbers, underscore, hyphen; 1-64 chars)' });
 
-    // Cap monitors per account, so multiple devices share one quota.
-    let accountMonitors = 0;
+    // Account monitors share a quota across devices; guest monitors share it per device token.
+    let ownerMonitors = 0;
     for (const [, m] of monitors) {
-      const owner = m.accountKey || accountKey(m.accountEmail);
-      if (owner === auth.accountKey && (m.status === 'waiting' || m.status === 'monitoring')) accountMonitors++;
+      if (monitorBelongsTo(m, owner) && (m.status === 'waiting' || m.status === 'monitoring')) ownerMonitors++;
     }
-    if (accountMonitors >= MAX_MONITORS_PER_SESSION) {
+    if (ownerMonitors >= MAX_MONITORS_PER_SESSION) {
       return res.status(429).json({ error: `最多同時 ${MAX_MONITORS_PER_SESSION} 個監控` });
     }
 
-    const monitorId = uuidv4().slice(0, 8);
+    const stores = await getMonitorStores();
+    const selectedStore = stores.find(store => Number(store.id) === sid);
+    if (!selectedStore) return res.status(400).json({ error: '找不到選擇的店鋪' });
+    const currentWait = validInt(selectedStore.wait) ?? 0;
+    const minutesUntilTarget = (targetAt - now) / 60000;
+    if (selectedStore.storeStatus !== 'CLOSED' && currentWait > 0 && minutesUntilTarget < currentWait) {
+      return res.status(400).json({
+        error: `目前等候約 ${currentWait} 分鐘，但距離所選時間只剩 ${Math.max(0, Math.floor(minutesUntilTarget))} 分鐘，已來不及排隊，請選擇更晚的時間`,
+      });
+    }
+
+    const monitorId = crypto.randomBytes(16).toString('base64url');
     const pi = validInt(pollInterval);
     const pollSec = pi == null ? 60 : Math.max(30, Math.min(300, pi));
     const intervalMs = pollSec * 1000;
-
-    // Compute absolute target timestamp in Taipei timezone
-    const taipeiNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
-    const [th, tm] = targetTime.split(':').map(Number);
-    const targetAt = new Date(taipeiNow);
-    targetAt.setHours(th, tm, 0, 0);
-    if (targetAt < taipeiNow) targetAt.setDate(targetAt.getDate() + 1);
 
     const early = Math.max(0, Math.min(30, validInt(earlyWindow) ?? 10));
     const late = Math.max(0, Math.min(30, validInt(lateWindow) ?? 5));
 
     const monitor = {
-      monitorId, storeid: sid, storeName: storeName || '', adult, child, targetTime, ntfyTopic,
-      sessionId,
-      accountKey: auth.accountKey,
-      accountEmail: auth.session.email,
+      monitorId, storeid: sid, storeName, adult: adultCount, child: childCount, targetDate, targetTime, ntfyTopic,
+      ownerType: owner.ownerType,
+      ownerId: owner.ownerId,
       earlyWindow: early,
       lateWindow: late,
       pollInterval: pollSec,
-      targetAt: targetAt.getTime(),
+      targetAt,
       status: 'waiting',
       lastWait: null,
       isRunning: false,
@@ -799,7 +855,7 @@ app.post('/api/monitor', async (req, res) => {
     try {
       await sendNtfyNotification(monitor.ntfyTopic, {
         title: `壽司郎 ${monitor.storeName || `店號 ${monitor.storeid}`} - 監控已啟動`,
-        message: `📡 監控已成功啟動\n⏱️ 目標時間 ${monitor.targetTime}\n🆔 監控 ID ${monitor.monitorId}\n🔔 Topic: ${monitor.ntfyTopic}`,
+        message: `📡 監控已成功啟動\n⏱️ 目標時間 ${monitor.targetDate} ${monitor.targetTime}\n🆔 監控 ID ${monitor.monitorId}\n🔔 Topic: ${monitor.ntfyTopic}`,
         priority: 3,
         tags: ['sushi', 'satellite'],
       });
@@ -818,17 +874,16 @@ app.post('/api/monitor', async (req, res) => {
 });
 
 function safeMonitor(m) {
-  const { intervalId, isRunning, sessionId, accountKey, accountEmail, ...safe } = m;
+  const { intervalId, isRunning, sessionId, accountKey, accountEmail, ownerType, ownerId, ...safe } = m;
   return safe;
 }
 
 app.get('/api/monitor/:id', (req, res) => {
   const m = monitors.get(req.params.id);
   if (!m) return res.status(404).json({ error: 'Not found' });
-  const auth = getSessionAuth(req.query.sessionId);
-  if (!auth) return res.status(401).json({ error: 'Session expired' });
-  const owner = m.accountKey || accountKey(m.accountEmail);
-  if (owner && owner !== auth.accountKey) return res.status(403).json({ error: 'Forbidden' });
+  const owner = getMonitorOwner(req, req.query.sessionId);
+  if (owner.error) return res.status(owner.error).json({ error: owner.message });
+  if (!monitorBelongsTo(m, owner)) return res.status(404).json({ error: 'Not found' });
   res.json(safeMonitor(m));
 });
 
@@ -836,10 +891,9 @@ app.delete('/api/monitor/:id', (req, res) => {
   const m = monitors.get(req.params.id);
   if (!m) return res.status(404).json({ error: 'Not found' });
   const { sessionId } = req.body || req.query;
-  const auth = getSessionAuth(sessionId);
-  if (!auth) return res.status(401).json({ error: 'Session expired' });
-  const owner = m.accountKey || accountKey(m.accountEmail);
-  if (owner && owner !== auth.accountKey) return res.status(403).json({ error: 'Forbidden' });
+  const owner = getMonitorOwner(req, sessionId);
+  if (owner.error) return res.status(owner.error).json({ error: owner.message });
+  if (!monitorBelongsTo(m, owner)) return res.status(404).json({ error: 'Not found' });
   clearInterval(m.intervalId);
   m.status = 'cancelled';
   monitors.delete(req.params.id);
@@ -848,12 +902,11 @@ app.delete('/api/monitor/:id', (req, res) => {
 });
 
 app.get('/api/monitors', (req, res) => {
-  const auth = getSessionAuth(req.query.sessionId);
-  if (!auth) return res.json([]);
+  const owner = getMonitorOwner(req, req.query.sessionId);
+  if (owner.error) return res.status(owner.error).json({ error: owner.message });
   const list = [];
   for (const [, m] of monitors) {
-    const owner = m.accountKey || accountKey(m.accountEmail);
-    if (owner !== auth.accountKey) continue;
+    if (!monitorBelongsTo(m, owner)) continue;
     list.push(safeMonitor(m));
   }
   res.json(list);
@@ -937,7 +990,7 @@ async function checkAndNotify(monitorId) {
       shouldNotify = true;
       const arriveIn = Math.max(0, Math.round(minutesUntilTarget));
       notifyTitle = `壽司郎 ${store.name} - 現在沒人排隊！`;
-      notifyMessage = `🍣 ${store.name}\n🎉 目前無需等候，直接去吃！\n👥 ${m.adult}大${m.child}小\n⏱️ 目標時間 ${m.targetTime}，約 ${arriveIn} 分鐘後`;
+      notifyMessage = `🍣 ${store.name}\n🎉 目前無需等候，直接去吃！\n👥 ${m.adult}大${m.child}小\n⏱️ 目標時間 ${m.targetDate || ''} ${m.targetTime}，約 ${arriveIn} 分鐘後`;
       m.logs.push(`[${ts}] 無人排隊，直接去吃！(目標 ${arriveIn}分後)`);
     } else if (waitMinutes > 0) {
       // Has queue — check if now + wait ≈ target
@@ -947,7 +1000,7 @@ async function checkAndNotify(monitorId) {
         shouldNotify = true;
         const arriveIn = Math.round(waitMinutes);
         notifyTitle = `壽司郎 ${store.name} - 現在去抽號！`;
-        notifyMessage = `🍣 ${store.name}\n⏰ 目前等候 ${waitMinutes} 分鐘\n👥 ${m.adult}大${m.child}小\n⏱️ 抽號後約 ${arriveIn} 分鐘入座（目標 ${m.targetTime}）\n\n請立即打開壽司郎 APP 按「立即前往」抽號！`;
+        notifyMessage = `🍣 ${store.name}\n⏰ 目前等候 ${waitMinutes} 分鐘\n👥 ${m.adult}大${m.child}小\n⏱️ 抽號後約 ${arriveIn} 分鐘入座（目標 ${m.targetDate || ''} ${m.targetTime}）\n\n請立即打開壽司郎 APP 按「立即前往」抽號！`;
         m.logs.push(`[${ts}] 最佳時機！抽號等 ${waitMinutes}分 → 約 ${arriveIn}分後入座`);
       }
     }
@@ -1000,6 +1053,9 @@ const cleanupInterval = setInterval(() => {
   for (const [ip, entry] of loginAttempts) {
     if (now > entry.resetAt) loginAttempts.delete(ip);
   }
+  for (const [ip, entry] of guestMonitorAttempts) {
+    if (now > entry.resetAt) guestMonitorAttempts.delete(ip);
+  }
 }, 3600000);
 cleanupInterval.unref();
 
@@ -1011,7 +1067,7 @@ function restorePersistedMonitors() {
       continue;
     }
 
-    const isDone = ['notified', 'failed', 'cancelled'].includes(record.status);
+    let isDone = ['notified', 'failed', 'cancelled'].includes(record.status);
     const createdAt = new Date(record.createdAt).getTime();
     if (isDone && Number.isFinite(createdAt) && createdAt < now - 12 * 3600 * 1000) {
       delete db.monitors[id];
@@ -1019,6 +1075,28 @@ function restorePersistedMonitors() {
     }
 
     const pollSec = Math.max(30, Math.min(300, validInt(record.pollInterval) ?? 60));
+    if (!validTimeValue(record.targetTime) || !Number.isFinite(record.targetAt)) {
+      delete db.monitors[id];
+      continue;
+    }
+    if (!validDateValue(record.targetDate)) record.targetDate = taipeiDateFromTimestamp(record.targetAt);
+    if (!isDone && record.targetAt <= now) {
+      record.status = 'failed';
+      record.logs = [...(Array.isArray(record.logs) ? record.logs : []), '[系統] 目標日期時間已過，監控已停止'].slice(-MAX_MONITOR_LOGS);
+      isDone = true;
+    }
+    if (!record.ownerType || !record.ownerId) {
+      const legacyOwner = record.accountKey || accountKey(record.accountEmail);
+      if (!legacyOwner) {
+        delete db.monitors[id];
+        continue;
+      }
+      record.ownerType = 'account';
+      record.ownerId = legacyOwner;
+    }
+    delete record.sessionId;
+    delete record.accountKey;
+    delete record.accountEmail;
     const monitor = {
       ...record,
       pollInterval: pollSec,
